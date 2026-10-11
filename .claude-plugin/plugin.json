@@ -1,0 +1,54 @@
+{
+  "name": "session-radar",
+  "version": "1.0.0",
+  "description": "Claude Code desktop (macOS) mod: per-session completion notifications that jump to the session on click, a custom sound, a 'recent sessions' pane with background-subagent status, and token usage / cost stats.",
+  "author": { "name": "Tina0529", "url": "https://github.com/Tina0529" },
+  "homepage": "https://github.com/Tina0529/claude-session-radar",
+  "repository": "https://github.com/Tina0529/claude-session-radar",
+  "license": "MIT",
+  "keywords": ["mod", "notification", "sessions", "usage", "tokens", "macos", "desktop"],
+  "userConfig": {
+    "doneSound": {
+      "type": "string",
+      "title": "Done sound / 完成提示音",
+      "description": "Sound played when a turn finishes. A name from ~/Library/Sounds or /System/Library/Sounds (e.g. Glass, Hero, Ping, Submarine), or an absolute path to an audio file.",
+      "default": "Glass"
+    },
+    "errorSound": {
+      "type": "string",
+      "title": "Error sound / 出错提示音",
+      "description": "Sound played when a turn errors or is interrupted. Same format as doneSound.",
+      "default": "Basso"
+    },
+    "sound": {
+      "type": "boolean",
+      "title": "Play sound / 播放提示音",
+      "description": "Play a sound when a turn finishes.",
+      "default": true
+    },
+    "notify": {
+      "type": "boolean",
+      "title": "macOS notification / 系统通知",
+      "description": "Show a macOS notification when a turn finishes (clickable if terminal-notifier is installed).",
+      "default": true
+    },
+    "notifyMinSeconds": {
+      "type": "number",
+      "title": "Min seconds to notify / 最短提醒时长",
+      "description": "Turns that finish faster than this (seconds) do not notify or play a sound. Errors always do.",
+      "default": 20
+    },
+    "speak": {
+      "type": "boolean",
+      "title": "Speak / 语音播报",
+      "description": "Also speak '<session> done' with the macOS voice.",
+      "default": false
+    },
+    "keepDays": {
+      "type": "number",
+      "title": "Keep days / 记录保留天数",
+      "description": "How many days of sessions the pane keeps.",
+      "default": 7
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "name": "session-radar",
+  "description": "session-radar: a Claude Code desktop (macOS) mod for session notifications, a recent-sessions pane and token usage stats.",
+  "owner": {
+    "name": "Tina0529",
+    "url": "https://github.com/Tina0529"
+  },
+  "plugins": [
+    {
+      "name": "session-radar",
+      "source": "./",
+      "description": "Notifications that jump to the finished session, a recent-sessions pane, and token usage stats for the Claude Code desktop app on macOS."
+    }
+  ]
+}
