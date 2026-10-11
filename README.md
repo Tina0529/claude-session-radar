@@ -2,6 +2,10 @@
 
 **Claude Code 桌面版（macOS）的 mod：同时开很多个 session 时，让你一眼看到哪个跑完了、点一下就切过去，顺便统计 token 用量。**
 
+![session-radar 总览：右上角是可点击的完成通知，输入框上方是横条，右侧是「最近 session」看板](docs/images/overview.png)
+
+<sub>截图均为演示数据，按插件实际界面还原。</sub>
+
 > English summary: a Claude Code **mod** for the **Claude desktop app on macOS**. It shows which of your many sessions just finished (macOS notification that jumps to the session on click, a custom sound, a band above the prompt, a "recent sessions" pane that also knows when background subagents are still running) and adds a token usage / cost page. UI text is Chinese. Install: `claude plugin install session-radar --marketplace Tina0529/claude-session-radar`, then restart the desktop app.
 
 ---
@@ -36,6 +40,8 @@
   📁 my-project · 用时 2m13s · 工具 18 次
   ```
 
+  <img src="docs/images/notification.png" width="420" alt="完成通知">
+
 - 同时播放提示音。完成和出错用不同的声音，都能换成你自己的音效。
 - 很快就结束的回合（默认 20 秒以内）不打扰你，因为你多半正盯着看。出错和中断总会提醒。
 
@@ -47,6 +53,8 @@
 ✅ 设计评审 · 完成 ↗   📁 design · 2分钟前   ×
 ▸ 最近 session   近1小时 ✅5 ⏳2 🔄1   · 今天 1.2亿 token ≈ $86.40
 ```
+
+<img src="docs/images/band.png" width="640" alt="输入框上方的横条">
 
 - **别的 session 刚跑完、你还没去看**，会出现在这里。点 `↗` 跳过去，点 `×` 忽略。
 - 最下面一行是近 1 小时的统计：✅ 完成、⏳ 运行中、🔄 后台运行中、❌ 出错，以及今天的 token 用量和折算金额。
@@ -63,6 +71,8 @@
    📁 research · 主回合 12s，后台 3 个任务在跑 · 工具 2 次
 ```
 
+<img src="docs/images/pane-sessions.png" width="420" alt="看板的会话页">
+
 - **点 session 名字那一行，直接切过去。**
 - 看板有焦点时，**按数字 1–9** 直接跳到对应 session。
 - **黄点 ●**：跑完以后你还没回去看过。
@@ -70,6 +80,8 @@
 - 看板开着还是收起，在所有 session 之间同步。切换 session 时保持你上次的选择。
 
 **用量页**：token 用量与按 API 标价折算的金额。
+
+<img src="docs/images/pane-usage.png" width="420" alt="看板的用量页">
 
 - 区间：今天、昨天、7 天、30 天、本月、上月、全部，也可以自定义。
 - 内容：总计（输入、输出、缓存写、缓存读）、按天柱状图、按模型、按项目前 10。
@@ -385,6 +397,9 @@ hooks/
   register.tsx       mod 本体：事件钩子、横条、看板、通知、声音
 bin/
   usage.py           token 用量统计（增量扫描 + 去重 + 计价，SQLite 缓存）
+docs/
+  images/            README 截图（演示数据）
+  make-screenshots.py  重新生成这些截图
 ```
 
 - **本地调试**：`claude --plugin-dir /path/to/claude-session-radar`，或在 Claude Code 里加载 `plugin-authoring` skill 后用热加载。
