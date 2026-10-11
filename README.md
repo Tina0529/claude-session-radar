@@ -237,7 +237,9 @@ echo '{"doneSound":"Hero","notifyMinSeconds":"30"}' | claude plugin configure se
 
 改完后**重启桌面 App**（Claude → Quit Claude），所有 session 都会用上新配置。
 
-也可以在终端的 `claude` 里输入 `/config`，在 session-radar 的配置行里修改。
+配置保存在 `~/.claude/settings.json` 的 `pluginConfigs["session-radar@session-radar"].options` 里。没设置过的项使用默认值，不会出现在这里。
+
+也可以在终端的 `claude` 里输入 `/plugin configure session-radar@session-radar`，在配置页里逐项修改。
 
 ### 换提示音
 
