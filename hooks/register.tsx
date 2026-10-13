@@ -49,11 +49,12 @@ const key = (id: string) => `s:${id}`
 const busy = (s: Rec['state']) => s === 'running' || s === 'background'   // 还没真正做完
 // 显示名：优先 session 名（侧栏标题）；没有或是 App 自动起的通用标题（压缩后的续接等）就用文件夹名
 const GENERIC_TITLE = /^(continuing previous conversation|new (session|conversation|chat)|untitled)/i
-// 侧栏里的最新 session 名（每 10 秒从桌面 App 的 session 列表读一次）：侧栏改名后不必等下一轮回答
+// 侧栏里的最新 session 名：每次发送消息时从桌面 App 的 session 列表读一次，存进各 session 共享的 store
+// （侧栏改名后，在任意一个 session 里发一条消息，所有地方就都换成新名字）
+const TITLES_KEY = 'titles'
 let TITLES: Record<string, string> = {}
 const titleOf = (r: Rec) => TITLES[r.id] || r.title
 const nameOf = (r: Rec) => { const t = titleOf(r); return t && !GENERIC_TITLE.test(t) ? t : r.project }
-const TITLES_MS = 10000
 const READ_TITLES = [
   'import glob, json, os',
   'd = {}',
@@ -70,6 +71,12 @@ async function readTitles($: any): Promise<Record<string, string> | null> {
     return exitCode === 0 ? JSON.parse(stdout) : null
   } catch { return null }
 }
+async function refreshTitles($: any) {
+  const tt = await readTitles($)
+  if (tt) { TITLES = tt; await $.store.set(TITLES_KEY, tt) }
+  return tt
+}
+async function loadTitles($: any) { TITLES = ((await $.store.get(TITLES_KEY)) as Record<string, string> | undefined) ?? TITLES }
 const age = (ms: number) => {
   const s = Math.max(0, Math.round(ms / 1000))
   return s < 60 ? `${s}秒前` : s < 3600 ? `${Math.round(s / 60)}分钟前` : s < 86400 ? `${Math.round(s / 3600)}小时前` : `${Math.round(s / 86400)}天前`
@@ -125,7 +132,6 @@ export const register: Register = (on, options) => {
   let usage: any = null          // 最近一次统计结果（含 today 和当前区间）
   let usageAt = 0
   let usageBusy = false
-  let titlesAt = 0
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
@@ -171,16 +177,6 @@ export const register: Register = (on, options) => {
           await $.store.set(key(rec.id), rec)
         }
       }
-      // 侧栏改名：定期读一遍所有 session 的当前名字；自己的记录也顺手更新，通知里用的就是新名字
-      const tNow = await $.clock.now()
-      if (tNow - titlesAt > TITLES_MS) {
-        titlesAt = tNow
-        const tt = await readTitles($)
-        if (tt) {
-          TITLES = tt
-          if (rec && tt[rec.id] && tt[rec.id] !== rec.title) { rec.title = tt[rec.id]; await $.store.set(key(rec.id), rec) }
-        }
-      }
       // token 用量：每 USAGE_MS 刷新一次（今天 + 当前选中的区间）；扫描有文件锁，多个 session 不会重复扫
       const now = await $.clock.now()
       if (!usageBusy && now - usageAt > USAGE_MS) {
@@ -206,7 +202,12 @@ export const register: Register = (on, options) => {
       await $.store.set(key(rec.id), rec)
       await $.store.set(seenKey(rec.id), now)   // 你已经在这个 session 里操作了，别处不用再提示它
     }
-    return next(e)
+    const out = next(e)
+    // 发送消息时刷新一次所有 session 的名字（不挡住消息发送）
+    const tt = await refreshTitles($)
+    if (tt && rec && tt[rec.id] && tt[rec.id] !== rec.title) { rec.title = tt[rec.id]; await $.store.set(key(rec.id), rec) }
+    $.ui.invalidate('ui.render')
+    return out
   })
 
   // 后台任务跑完会唤醒 session 再跑一轮，这种回合没有 prompt.submit，也要显示成运行中
@@ -227,6 +228,7 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     const out = await next(e)
     if (!rec || e.agentId) return out            // 只管主回合，子 agent 的回合不提醒
+    await loadTitles($)
     const found = await lookup($, rec.id)
     if (found.localId) rec.localId = found.localId
     if (found.title) rec.title = found.title
@@ -321,6 +323,7 @@ export const register: Register = (on, options) => {
 
   // 输入框正上方的横条：最近 1 小时的状况摘要 + 看板开关按钮
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    await loadTitles($)
     if (!tracked || e.props.hasSurvey) return next(e)   // 有问卷占用横条时让路
     const { Box, Text, Button } = $.ui.resolve(e)
     const now = await $.clock.now()
@@ -371,6 +374,7 @@ export const register: Register = (on, options) => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    await loadTitles($)
     const { Box, Text, Button } = $.ui.resolve(e)
     const now = await $.clock.now()
     const me = rec?.id
