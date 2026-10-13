@@ -11,6 +11,11 @@ const LOG = 'log'               // 诊断日志：每轮结束是否通知、播
 // ── token 用量 ───────────────────────────────────────────
 const USAGE_MS = 60000          // 用量数据刷新间隔
 const TAB = 'pref:paneTab'      // 看板标签页：sessions | usage（跨 session 共享）
+const SUB = 'pref:sessTab'      // 会话页的分类：todo | run | pin | all（跨 session 共享）
+const PINS = 'pins'             // 置顶的 session id 列表
+const UNSEEN_MS = 86400_000     // 黄点（跑完未看）保留一天，过了就不算待处理
+// 「你说」里不算用户原话的系统消息：后台任务通知、子 agent 消息、App 重启续跑等
+const isNoise = (t: string) => /^\s*(<|\[Request interrupted|The app was quit|This session is being continued|Continue from where you left off)/i.test(t)
 const RANGE = 'pref:usageRange' // 用量区间（跨 session 共享）
 const RANGES: [string, string][] = [['today', '今天'], ['yesterday', '昨天'], ['7d', '7天'], ['30d', '30天'],
   ['month', '本月'], ['lastmonth', '上月'], ['all', '全部']]
@@ -156,7 +161,8 @@ export const register: Register = (on, options) => {
     for (const k of await $.store.keys()) {
       if (!k.startsWith('s:')) continue
       const r = (await $.store.get(k)) as Rec | undefined
-      if (!r || now - r.at > cfg.keepDays * 86400_000 || (!r.localId && r.id !== id)) await $.store.delete(k)
+      const pinnedIds = ((await $.store.get(PINS)) as string[] | undefined) ?? []   // 置顶的不过期
+      if (!r || (now - r.at > cfg.keepDays * 86400_000 && !pinnedIds.includes(r.id)) || (!r.localId && r.id !== id)) await $.store.delete(k)
     }
     for (const k of await $.store.keys()) {   // 对应记录已删除的「已看过」标记
       if (k.startsWith('seen:') && (await $.store.get(`s:${k.slice(5)}`)) === undefined) await $.store.delete(k)
@@ -197,7 +203,7 @@ export const register: Register = (on, options) => {
       const text = String((e as any).text ?? '').replace(/\s+/g, ' ').trim()
       if (!rec.title) rec.title = text.slice(0, 40)
       // 斜杠命令、空输入不覆盖上一次的摘要
-      if (text && !text.startsWith('/')) rec.ask = text.length > 36 ? `${text.slice(0, 36)}…` : text
+      if (text && !text.startsWith('/') && !isNoise(text)) rec.ask = text.length > 36 ? `${text.slice(0, 36)}…` : text
       Object.assign(rec, { state: 'running', startedAt: now, at: now, tools: 0 })
       await $.store.set(key(rec.id), rec)
       await $.store.set(seenKey(rec.id), now)   // 你已经在这个 session 里操作了，别处不用再提示它
@@ -474,21 +480,43 @@ export const register: Register = (on, options) => {
       const r = (await $.store.get(k)) as Rec | undefined
       if (r && (r.localId || r.id === me)) all.push(r)   // 只列有窗口的 session
     }
+    const pins = ((await $.store.get(PINS)) as string[] | undefined) ?? []
+    const pinned = (r: Rec) => pins.includes(r.id)
     all.sort((a, b) => b.at - a.at)
-    const rows = all.slice(0, Math.max(3, (e.viewport?.rows ?? 30) - 4))
     const color = (s: Rec['state']) => (s === 'done' ? 'green' : s === 'running' ? 'yellow' : s === 'background' ? 'cyan' : s === 'error' ? 'red' : 'gray')
 
-    // 跑完后还没回去看过的 session 标黄点（和横条的完成提示共用「已看过」标记）
+    // 跑完后还没回去看过（一天内）的 session 标黄点 = 待处理（和横条的完成提示共用「已看过」标记）
     const unseen = new Set<string>()
-    for (const r of rows) {
-      if (r.id !== me && !busy(r.state) && r.at > Number((await $.store.get(seenKey(r.id))) ?? 0)) unseen.add(r.id)
+    for (const r of all) {
+      if (r.id !== me && !busy(r.state) && now - r.at < UNSEEN_MS && r.at > Number((await $.store.get(seenKey(r.id))) ?? 0)) unseen.add(r.id)
     }
+    const groups: Record<string, Rec[]> = {
+      todo: all.filter(r => unseen.has(r.id)),
+      run: all.filter(r => busy(r.state)),
+      pin: all.filter(pinned),
+      all: [...all.filter(pinned), ...all.filter(r => !pinned(r))],
+    }
+    const stored = (await $.store.get(SUB)) as string | undefined
+    const sub = stored && groups[stored] ? stored : (groups.todo.length ? 'todo' : 'all')
+    const SUBS: [string, string][] = [['todo', '待处理'], ['run', '运行中'], ['pin', '★ 置顶'], ['all', '全部']]
+    const subTabs = (
+      <Box key="subtabs" flexDirection="row" flexWrap="wrap" marginBottom={1}>
+        {SUBS.map(([k, label]) => (
+          <Button key={`sub-${k}`} label={`${sub === k ? '● ' : ''}${label} ${groups[k].length}`} dimColor={sub !== k} onPress={async () => {
+            await $.store.set(SUB, k); $.ui.invalidate('ui.render')
+          }} />
+        ))}
+      </Box>
+    )
+    const EMPTY: Record<string, string> = { todo: '没有待处理的 session 🎉', run: '现在没有在跑的 session', pin: '还没有置顶。点每行末尾的 ☆ 钉住常用的 session', all: '还没有记录。跑一轮对话后这里会出现。' }
+    const rows = groups[sub].slice(0, Math.max(3, (e.viewport?.rows ?? 30) - 6))
     let hot = 0                       // 可跳转的前 9 行配数字快捷键（看板有焦点时按 1-9）
 
     return (
       <Box flexDirection="column">
         {tabs}
-        {rows.length === 0 && <Text dimColor>还没有记录。跑一轮对话后这里会出现。</Text>}
+        {subTabs}
+        {rows.length === 0 && <Text dimColor>{EMPTY[sub]}</Text>}
         {rows.map(r => {
           const canOpen = r.id !== me && !!r.localId
           const key = canOpen && hot < 9 ? String(++hot) : undefined
@@ -502,21 +530,28 @@ export const register: Register = (on, options) => {
           ].filter(Boolean)            // 按钮里只能放 Text，false 要先去掉
           const meta = r.turns === 0 && !busy(r.state)
             ? '还没跑过'
-            : `${r.state === 'running' ? '进行中' : r.state === 'background' ? `主回合 ${dur(r.seconds)}，后台 ${r.bg ?? '?'} 个任务在跑` : `用时 ${dur(r.seconds)}`} · 工具 ${r.tools} 次${r.ask ? ` · 你说「${r.ask}」` : ''}`
+            : `${r.state === 'running' ? '进行中' : r.state === 'background' ? `主回合 ${dur(r.seconds)}，后台 ${r.bg ?? '?'} 个任务在跑` : `用时 ${dur(r.seconds)}`} · 工具 ${r.tools} 次${r.ask && !isNoise(r.ask) ? ` · 你说「${r.ask}」` : ''}`
           return (
             <Box key={r.id} flexDirection="column" marginBottom={1}>
-              {canOpen
-                ? <Button key={`go-${r.id}`} plain hotkey={key} onPress={async () => {
-                    await $.store.set(seenKey(r.id), r.at)
-                    void $.process.run(['open', `claude://code/continue?session=${r.localId}&source=desktop_action`])
-                    $.ui.invalidate('ui.render')
-                  }}>{title}</Button>
-                : <Text>{title}</Text>}
+              <Box flexDirection="row">
+                {canOpen
+                  ? <Button key={`go-${r.id}`} plain hotkey={key} onPress={async () => {
+                      await $.store.set(seenKey(r.id), r.at)
+                      void $.process.run(['open', `claude://code/continue?session=${r.localId}&source=desktop_action`])
+                      $.ui.invalidate('ui.render')
+                    }}>{title}</Button>
+                  : <Text>{title}</Text>}
+                <Button key={`pin-${r.id}`} plain dimColor={!pinned(r)} label={pinned(r) ? ' ★' : ' ☆'} onPress={async () => {
+                  const cur = ((await $.store.get(PINS)) as string[] | undefined) ?? []
+                  await $.store.set(PINS, cur.includes(r.id) ? cur.filter(x => x !== r.id) : [...cur, r.id])
+                  $.ui.invalidate('ui.render')
+                }} />
+              </Box>
               <Text dimColor wrap="truncate-end">{'   '}📁 {r.project} · {meta}</Text>
             </Box>
           )
         })}
-        <Text key="hint" dimColor>点 session 名字直接切过去 · 黄点 = 跑完后还没看过 · 🔄 = 后台 subagent 还在跑</Text>
+        <Text key="hint" dimColor>点名字直接切过去 · ☆ 置顶 · 黄点 = 一天内跑完还没看 · 🔄 = 后台 subagent 还在跑</Text>
       </Box>
     )
   })
