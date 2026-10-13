@@ -49,7 +49,27 @@ const key = (id: string) => `s:${id}`
 const busy = (s: Rec['state']) => s === 'running' || s === 'background'   // 还没真正做完
 // 显示名：优先 session 名（侧栏标题）；没有或是 App 自动起的通用标题（压缩后的续接等）就用文件夹名
 const GENERIC_TITLE = /^(continuing previous conversation|new (session|conversation|chat)|untitled)/i
-const nameOf = (r: Rec) => (r.title && !GENERIC_TITLE.test(r.title) ? r.title : r.project)
+// 侧栏里的最新 session 名（每 10 秒从桌面 App 的 session 列表读一次）：侧栏改名后不必等下一轮回答
+let TITLES: Record<string, string> = {}
+const titleOf = (r: Rec) => TITLES[r.id] || r.title
+const nameOf = (r: Rec) => { const t = titleOf(r); return t && !GENERIC_TITLE.test(t) ? t : r.project }
+const TITLES_MS = 10000
+const READ_TITLES = [
+  'import glob, json, os',
+  'd = {}',
+  'for f in glob.glob(os.path.expanduser("~/Library/Application Support/Claude/claude-code-sessions/*/*/local_*.json")):',
+  '    try:',
+  '        j = json.load(open(f))',
+  '        if j.get("cliSessionId"): d[j["cliSessionId"]] = j.get("title") or ""',
+  '    except Exception: pass',
+  'print(json.dumps(d, ensure_ascii=False))',
+].join('\n')
+async function readTitles($: any): Promise<Record<string, string> | null> {
+  try {
+    const { exitCode, stdout } = await $.process.run(['/usr/bin/python3', '-c', READ_TITLES], { timeoutMs: 10000 })
+    return exitCode === 0 ? JSON.parse(stdout) : null
+  } catch { return null }
+}
 const age = (ms: number) => {
   const s = Math.max(0, Math.round(ms / 1000))
   return s < 60 ? `${s}秒前` : s < 3600 ? `${Math.round(s / 60)}分钟前` : s < 86400 ? `${Math.round(s / 3600)}小时前` : `${Math.round(s / 86400)}天前`
@@ -105,6 +125,7 @@ export const register: Register = (on, options) => {
   let usage: any = null          // 最近一次统计结果（含 today 和当前区间）
   let usageAt = 0
   let usageBusy = false
+  let titlesAt = 0
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
@@ -148,6 +169,16 @@ export const register: Register = (on, options) => {
         if (bg !== rec.bg) {
           Object.assign(rec, bg > 0 ? { bg } : { bg: 0, state: 'done', at: await $.clock.now() })
           await $.store.set(key(rec.id), rec)
+        }
+      }
+      // 侧栏改名：定期读一遍所有 session 的当前名字；自己的记录也顺手更新，通知里用的就是新名字
+      const tNow = await $.clock.now()
+      if (tNow - titlesAt > TITLES_MS) {
+        titlesAt = tNow
+        const tt = await readTitles($)
+        if (tt) {
+          TITLES = tt
+          if (rec && tt[rec.id] && tt[rec.id] !== rec.title) { rec.title = tt[rec.id]; await $.store.set(key(rec.id), rec) }
         }
       }
       // token 用量：每 USAGE_MS 刷新一次（今天 + 当前选中的区间）；扫描有文件锁，多个 session 不会重复扫
