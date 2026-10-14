@@ -331,6 +331,7 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     await loadTitles($)
     if (!tracked || e.props.hasSurvey) return next(e)   // 有问卷占用横条时让路
+    const below = await next(e)   // 下层插件（比如 voice-reply）画的内容，包在自己下面一起显示
     const { Box, Text, Button } = $.ui.resolve(e)
     const now = await $.clock.now()
     const isOpen = (await $.store.get(PREF)) === true
@@ -379,6 +380,7 @@ export const register: Register = (on, options) => {
             <Text dimColor>  · 今天 {fmtTok(usage.ranges.today.totals.total)} token ≈ {fmtUsd(usage.ranges.today.totals.cost)}</Text>
           )}
         </Box>
+        {below ? below : null}
       </Box>
     )
   })
