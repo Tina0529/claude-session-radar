@@ -4,8 +4,8 @@ import type { Register } from 'claude-code'
 const SYNC_MS = 2000            // 各 session 对齐「看板开/关」的间隔
 const PANE = 'session-radar'
 const PREF = 'pref:paneOpen'    // 看板开关状态：跨 session 共享，切换 session 时保持
-const NOTICE_MINUTES = 15       // 横条上的「可点击完成提示」保留多久
-const NOTICE_MAX = 3            // 横条上最多同时显示几条
+const NOTICE_MAX = 3            // 横条上的快速切换栏：最近完成的几个 session
+const hideKey = (id: string) => `hide:${id}`   // 在横条上点 × 收起（这个 session 下次跑完会再出现）
 const seenKey = (id: string) => `seen:${id}`   // 已看过的完成提示（跨 session 共享，点过一处其他地方也消失）
 const LOG = 'log'               // 诊断日志：每轮结束是否通知、播音结果
 // ── token 用量 ───────────────────────────────────────────
@@ -165,7 +165,7 @@ export const register: Register = (on, options) => {
       if (!r || (now - r.at > cfg.keepDays * 86400_000 && !pinnedIds.includes(r.id)) || (!r.localId && r.id !== id)) await $.store.delete(k)
     }
     for (const k of await $.store.keys()) {   // 对应记录已删除的「已看过」标记
-      if (k.startsWith('seen:') && (await $.store.get(`s:${k.slice(5)}`)) === undefined) await $.store.delete(k)
+      if ((k.startsWith('seen:') || k.startsWith('hide:')) && (await $.store.get(`s:${k.slice(5)}`)) === undefined) await $.store.delete(k)
     }
 
     // 每隔 SYNC_MS 对齐一次：看板开关跟随全局偏好；看板开着时顺便刷新内容
@@ -342,23 +342,27 @@ export const register: Register = (on, options) => {
       const r = (await $.store.get(k)) as Rec | undefined
       if (!r || !r.localId) continue
       if (busy(r.state) || now - r.at < 3600_000) n[r.state] += 1
-      // 别的 session 刚跑完、你还没看过 → 做成可点击提示
+      // 快速切换栏：别的 session 最近跑完的，不管看没看过都列出来；没看过的（一天内）带黄点、排前面
+      if (r.id === me || busy(r.state) || r.turns === 0) continue
+      if (r.at <= Number((await $.store.get(hideKey(r.id))) ?? 0)) continue
       const seen = Number((await $.store.get(seenKey(r.id))) ?? 0)
-      if (r.id !== me && !busy(r.state) && now - r.at < NOTICE_MINUTES * 60_000 && r.at > seen) notices.push(r)
+      ;(r as any)._new = r.at > seen && now - r.at < UNSEEN_MS
+      notices.push(r)
     }
-    notices.sort((a, b) => b.at - a.at)
+    notices.sort((a, b) => Number((b as any)._new) - Number((a as any)._new) || b.at - a.at)
     return (
       <Box flexDirection="column">
         {notices.slice(0, NOTICE_MAX).map(r => (
           <Box key={`n-${r.id}`} flexDirection="row">
-            <Button key={`open-${r.id}`} label={`${ICON[r.state]} ${nameOf(r)} · ${LABEL[r.state]} ↗`} onPress={async () => {
+            <Button key={`open-${r.id}`} onPress={async () => {
               await $.store.set(seenKey(r.id), r.at)
               void $.process.run(['open', `claude://code/continue?session=${r.localId}&source=desktop_action`])
               $.ui.invalidate('ui.render')
-            }} />
+            }}>{[(r as any)._new && <Text key="dot" color="yellow">● </Text>, <Text key="lb">{`${ICON[r.state]} ${nameOf(r)} · ${LABEL[r.state]} ↗`}</Text>].filter(Boolean)}</Button>
             <Text dimColor wrap="truncate-end">  📁 {r.project} · {age(now - r.at)}</Text>
             <Button key={`dismiss-${r.id}`} label="×" onPress={async () => {
               await $.store.set(seenKey(r.id), r.at)
+              await $.store.set(hideKey(r.id), r.at)
               $.ui.invalidate('ui.render')
             }} />
           </Box>
