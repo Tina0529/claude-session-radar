@@ -4,7 +4,7 @@ import type { Register } from 'claude-code'
 const SYNC_MS = 2000            // 各 session 对齐「看板开/关」的间隔
 const PANE = 'session-radar'
 const PREF = 'pref:paneOpen'    // 看板开关状态：跨 session 共享，切换 session 时保持
-const NOTICE_MAX = 3            // 横条上的快速切换栏：最近完成的几个 session
+const NOTICE_MAX = 3            // 横条上的快速切换栏：最多列几个「跑完还没看」的 session
 const hideKey = (id: string) => `hide:${id}`   // 在横条上点 × 收起（这个 session 下次跑完会再出现）
 const seenKey = (id: string) => `seen:${id}`   // 已看过的完成提示（跨 session 共享，点过一处其他地方也消失）
 const LOG = 'log'               // 诊断日志：每轮结束是否通知、播音结果
@@ -58,30 +58,44 @@ const GENERIC_TITLE = /^(continuing previous conversation|new (session|conversat
 // （侧栏改名后，在任意一个 session 里发一条消息，所有地方就都换成新名字）
 const TITLES_KEY = 'titles'
 let TITLES: Record<string, string> = {}
+// 桌面 App 记录的「最后切到这个 session 的时刻」：切过去看过就算已读（和名字一起读，不单独轮询）
+const FOCUS_KEY = 'focus'
+let FOCUS: Record<string, number> = {}
 const titleOf = (r: Rec) => TITLES[r.id] || r.title
 const nameOf = (r: Rec) => { const t = titleOf(r); return t && !GENERIC_TITLE.test(t) ? t : r.project }
 const READ_TITLES = [
   'import glob, json, os',
-  'd = {}',
+  'd, fo = {}, {}',
   'for f in glob.glob(os.path.expanduser("~/Library/Application Support/Claude/claude-code-sessions/*/*/local_*.json")):',
   '    try:',
-  '        j = json.load(open(f))',
-  '        if j.get("cliSessionId"): d[j["cliSessionId"]] = j.get("title") or ""',
+  '        j = json.load(open(f)); c = j.get("cliSessionId")',
+  '        if c: d[c] = j.get("title") or ""; fo[c] = j.get("lastFocusedAt") or 0',
   '    except Exception: pass',
-  'print(json.dumps(d, ensure_ascii=False))',
+  'print(json.dumps({"titles": d, "focus": fo}, ensure_ascii=False))',
 ].join('\n')
-async function readTitles($: any): Promise<Record<string, string> | null> {
+async function readTitles($: any): Promise<{ titles: Record<string, string>; focus: Record<string, number> } | null> {
   try {
     const { exitCode, stdout } = await $.process.run(['/usr/bin/python3', '-c', READ_TITLES], { timeoutMs: 10000 })
     return exitCode === 0 ? JSON.parse(stdout) : null
   } catch { return null }
 }
 async function refreshTitles($: any) {
-  const tt = await readTitles($)
-  if (tt) { TITLES = tt; await $.store.set(TITLES_KEY, tt) }
-  return tt
+  const r = await readTitles($)
+  if (r) { TITLES = r.titles; FOCUS = r.focus; await $.store.set(TITLES_KEY, r.titles); await $.store.set(FOCUS_KEY, r.focus) }
+  return r?.titles ?? null
 }
-async function loadTitles($: any) { TITLES = ((await $.store.get(TITLES_KEY)) as Record<string, string> | undefined) ?? TITLES }
+async function loadTitles($: any) {
+  TITLES = ((await $.store.get(TITLES_KEY)) as Record<string, string> | undefined) ?? TITLES
+  FOCUS = ((await $.store.get(FOCUS_KEY)) as Record<string, number> | undefined) ?? FOCUS
+}
+// 跑完以后还没看过（一天内）= 待处理：点过横条 / 看板、在里面发过消息、或在 App 里切过去看过，都算看过
+async function isUnseen($: any, r: Rec, me: string | undefined, now: number) {
+  if (r.id === me || busy(r.state) || r.turns === 0 || now - r.at >= UNSEEN_MS) return false
+  const seen = Math.max(Number((await $.store.get(seenKey(r.id))) ?? 0), FOCUS[r.id] ?? 0)
+  return r.at > seen
+}
+// 当前在看的 session（lastFocusedAt 最大的那个）
+const focusedId = () => { let best = 0, id = ''; for (const [k, t] of Object.entries(FOCUS)) if (t > best) { best = t; id = k } return id }
 const age = (ms: number) => {
   const s = Math.max(0, Math.round(ms / 1000))
   return s < 60 ? `${s}秒前` : s < 3600 ? `${Math.round(s / 60)}分钟前` : s < 86400 ? `${Math.round(s / 3600)}小时前` : `${Math.round(s / 86400)}天前`
@@ -247,6 +261,8 @@ export const register: Register = (on, options) => {
     const state: Rec['state'] = e.reason === 'answer' ? (bg > 0 ? 'background' : 'done') : e.reason === 'aborted' ? 'aborted' : 'error'
     Object.assign(rec, { state, bg, seconds, at: await $.clock.now(), turns: rec.turns + 1 })
     await $.store.set(key(rec.id), rec)
+    // 跑完时读一次 App 的焦点：你正看着它跑完的，不算「没看」，不进别的 session 的横条
+    if (await refreshTitles($) && focusedId() === rec.id) await $.store.set(seenKey(rec.id), rec.at)
 
     // 三行：是什么状态的哪个 session / 在哪个文件夹、花了多久 / 你最后让它做的事
     const head = `${ICON[state]} ${LABEL[state]}｜${nameOf(rec)}`
@@ -343,14 +359,14 @@ export const register: Register = (on, options) => {
       const r = (await $.store.get(k)) as Rec | undefined
       if (!r || !r.localId) continue
       if (busy(r.state) || now - r.at < 3600_000) n[r.state] += 1
-      // 快速切换栏：别的 session 最近跑完的，不管看没看过都列出来；没看过的（一天内）带黄点、排前面
-      if (r.id === me || busy(r.state) || r.turns === 0) continue
+      // 快速切换栏：只列跑完以后你还没看过的；看过（切过去 / 点过 / 发过消息）就不再占位
+      if (!(await isUnseen($, r, me, now))) continue
       if (r.at <= Number((await $.store.get(hideKey(r.id))) ?? 0)) continue
-      const seen = Number((await $.store.get(seenKey(r.id))) ?? 0)
-      ;(r as any)._new = r.at > seen && now - r.at < UNSEEN_MS
       notices.push(r)
     }
-    notices.sort((a, b) => Number((b as any)._new) - Number((a as any)._new) || b.at - a.at)
+    // 出错 / 中断的排前面，其余按跑完的先后
+    const bad = (r: Rec) => Number(r.state === 'error' || r.state === 'aborted')
+    notices.sort((a, b) => bad(b) - bad(a) || b.at - a.at)
     return (
       <Box flexDirection="column">
         {notices.slice(0, NOTICE_MAX).map(r => (
@@ -359,7 +375,7 @@ export const register: Register = (on, options) => {
               await $.store.set(seenKey(r.id), r.at)
               void $.process.run(['open', `claude://code/continue?session=${r.localId}&source=desktop_action`])
               $.ui.invalidate('ui.render')
-            }}>{[(r as any)._new && <Text key="dot" color="yellow">● </Text>, <Text key="lb">{`${ICON[r.state]} ${nameOf(r)} · ${LABEL[r.state]} ↗`}</Text>].filter(Boolean)}</Button>
+            }}>{[<Text key="dot" color="yellow">● </Text>, <Text key="lb">{`${ICON[r.state]} ${nameOf(r)} · ${LABEL[r.state]} ↗`}</Text>].filter(Boolean)}</Button>
             <Text dimColor wrap="truncate-end">  📁 {r.project} · {age(now - r.at)}</Text>
             <Button key={`dismiss-${r.id}`} label="×" onPress={async () => {
               await $.store.set(seenKey(r.id), r.at)
@@ -368,6 +384,7 @@ export const register: Register = (on, options) => {
             }} />
           </Box>
         ))}
+        {notices.length > NOTICE_MAX && <Text key="more" dimColor>  还有 {notices.length - NOTICE_MAX} 个没看，在看板「待处理」里</Text>}
         <Box flexDirection="row">
           <Button key="radar-toggle" label={isOpen ? '▾ 收起看板' : '▸ 最近 session'}
             onPress={() => setPane($, !isOpen)} />
@@ -494,7 +511,7 @@ export const register: Register = (on, options) => {
     // 跑完后还没回去看过（一天内）的 session 标黄点 = 待处理（和横条的完成提示共用「已看过」标记）
     const unseen = new Set<string>()
     for (const r of all) {
-      if (r.id !== me && !busy(r.state) && now - r.at < UNSEEN_MS && r.at > Number((await $.store.get(seenKey(r.id))) ?? 0)) unseen.add(r.id)
+      if (await isUnseen($, r, me, now)) unseen.add(r.id)
     }
     const groups: Record<string, Rec[]> = {
       todo: all.filter(r => unseen.has(r.id)),
