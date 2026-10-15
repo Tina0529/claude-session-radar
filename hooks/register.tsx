@@ -151,6 +151,7 @@ export const register: Register = (on, options) => {
   let usage: any = null          // 最近一次统计结果（含 today 和当前区间）
   let usageAt = 0
   let usageBusy = false
+  let query = ''                 // 看板会话页的搜索词（只在本 session 的看板里有效）
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
@@ -404,7 +405,7 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     await loadTitles($)
-    const { Box, Text, Button } = $.ui.resolve(e)
+    const { Box, Text, Button, Input } = $.ui.resolve(e) as any
     const now = await $.clock.now()
     const me = rec?.id
     const tab = String((await $.store.get(TAB)) ?? 'sessions')
@@ -416,6 +417,9 @@ export const register: Register = (on, options) => {
         <Button key="tab-u" label={tab === 'usage' ? '● 用量' : '用量'} onPress={async () => {
           await $.store.set(TAB, 'usage'); $.ui.invalidate('ui.render')
         }} />
+        {tab === 'sessions' && Input && <Input key="search" placeholder="🔍 搜索名字 / 文件夹 / 你说" value={query} submitLabel="搜索"
+          onInput={(v: string) => { query = v; $.ui.invalidate('ui.render') }}
+          onSubmit={(v: string) => { query = v; $.ui.invalidate('ui.render') }} />}
       </Box>
     )
 
@@ -532,14 +536,23 @@ export const register: Register = (on, options) => {
       </Box>
     )
     const EMPTY: Record<string, string> = { todo: '没有待处理的 session 🎉', run: '现在没有在跑的 session', pin: '还没有置顶。点每行末尾的 ☆ 钉住常用的 session', all: '还没有记录。跑一轮对话后这里会出现。' }
-    const rows = groups[sub].slice(0, Math.max(3, (e.viewport?.rows ?? 30) - 6))
+    // 有搜索词时：在全部 session 里按名字 / 文件夹 / 你说 / 侧栏标题过滤（不分标签页，置顶的排前）
+    const q = query.trim().toLowerCase()
+    const hit = (r: Rec) => [nameOf(r), titleOf(r), r.project, r.ask ?? ''].some(x => x.toLowerCase().includes(q))
+    const list = q ? groups.all.filter(hit) : groups[sub]
+    const rows = list.slice(0, Math.max(3, (e.viewport?.rows ?? 30) - 6))
     let hot = 0                       // 可跳转的前 9 行配数字快捷键（看板有焦点时按 1-9）
 
     return (
       <Box flexDirection="column">
         {tabs}
-        {subTabs}
-        {rows.length === 0 && <Text dimColor>{EMPTY[sub]}</Text>}
+        {q
+          ? <Box key="searching" flexDirection="row" marginBottom={1}>
+              <Text dimColor>搜索「{query.trim()}」：{list.length} 个  </Text>
+              <Button key="clear-q" label="× 清空" onPress={() => { query = ''; $.ui.invalidate('ui.render') }} />
+            </Box>
+          : subTabs}
+        {rows.length === 0 && <Text dimColor>{q ? '没有匹配的 session' : EMPTY[sub]}</Text>}
         {rows.map(r => {
           const canOpen = r.id !== me && !!r.localId
           const key = canOpen && hot < 9 ? String(++hot) : undefined
