@@ -1,6 +1,6 @@
 {
   "name": "session-radar",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Claude Code desktop (macOS) mod: per-session completion notifications that jump to the session on click, a custom sound, a 'recent sessions' pane with background-subagent status, and token usage / cost stats.",
   "author": { "name": "Tina0529", "url": "https://github.com/Tina0529" },
   "homepage": "https://github.com/Tina0529/claude-session-radar",

@@ -142,133 +142,177 @@ async function setPane($: any, open: boolean) {
   $.ui.invalidate('ui.render')
 }
 
+// 每个 session 进程里的状态（顶层函数要读写，所以收在一个对象里传）
+type St = {
+  rec: Rec | null
+  interactive: boolean
+  tracked: boolean               // 只有「有窗口」的 session 才记录和提醒
+  sync: { cancel: () => void } | null
+  usage: any                     // 最近一次统计结果（含 today 和当前区间）
+  usageAt: number
+  usageBusy: boolean
+  query: string                  // 看板会话页的搜索词（只在本 session 的看板里有效）
+  cwd: string
+  inTurn: boolean                // 正在跑一轮（初始化晚于回合开始时，用来把状态记成运行中）
+  retry: { cancel: () => void } | null
+  setupP: Promise<boolean> | null
+}
+
+// 认出「有窗口」的 session 并初始化。新建的 session 刚启动时，桌面 App 往往还没写好它的 local_*.json，
+// 一次查不到不能就此放弃（否则整个 session 都不显示、不记录）：之后发消息、回合开始 / 结束时再查，
+// 另外每 5 秒重试一次，最多 2 分钟
+function ensureTracked($: any, st: St, cfg: Cfg): Promise<boolean> {
+  if (st.tracked) return Promise.resolve(true)
+  if (!st.setupP) st.setupP = setupTracking($, st, cfg).finally(() => { st.setupP = null })
+  return st.setupP
+}
+async function setupTracking($: any, st: St, cfg: Cfg): Promise<boolean> {
+  const id = await $.session.id()
+  const now = await $.clock.now()
+  const found = await lookup($, id)
+  if (!(st.interactive || found.localId)) return false   // 无窗口的定时任务（或 App 还没写好记录）：先不做
+  st.tracked = true
+  st.retry?.cancel(); st.retry = null
+
+  // 命令注册单独兜底：和内置命令重名会被引擎拒绝（曾因 /usage 撞名导致后面的初始化全部没跑）
+  try { await $.command.register({ name: 'recent', description: '打开 / 收起「最近 session」看板' }) } catch { /* 忽略 */ }
+  try { await $.command.register({ name: 'tokens', description: 'token 用量。/tokens 打开用量页；/tokens 2026-09-01 2026-09-30 看指定区间' }) }
+  catch { try { await $.command.register({ name: 'radar-usage', description: 'token 用量（/tokens 被占用时的备用名）' }) } catch { /* 忽略 */ } }
+  const old = (await $.store.get(key(id))) as Rec | undefined
+  st.rec = old ?? { id, project: st.cwd.split('/').filter(Boolean).pop() || '~', title: '', state: st.inTurn ? 'running' : 'done', at: now, startedAt: now, seconds: 0, tools: 0, turns: 0 }
+  if (found.localId) st.rec.localId = found.localId
+  if (found.title) st.rec.title = found.title
+  await $.store.set(key(st.rec.id), st.rec)
+
+  // 清理：过期记录 + 以前误记的无窗口记录（没有侧栏 ID 的）
+  for (const k of await $.store.keys()) {
+    if (!k.startsWith('s:')) continue
+    const r = (await $.store.get(k)) as Rec | undefined
+    const pinnedIds = ((await $.store.get(PINS)) as string[] | undefined) ?? []   // 置顶的不过期
+    if (!r || (now - r.at > cfg.keepDays * 86400_000 && !pinnedIds.includes(r.id)) || (!r.localId && r.id !== id)) await $.store.delete(k)
+  }
+  for (const k of await $.store.keys()) {   // 对应记录已删除的「已看过」标记
+    if ((k.startsWith('seen:') || k.startsWith('hide:')) && (await $.store.get(`s:${k.slice(5)}`)) === undefined) await $.store.delete(k)
+  }
+
+  startSync($, st)
+  $.ui.invalidate('ui.render')
+  return true
+}
+
+
+// 每隔 SYNC_MS 对齐一次：看板开关跟随全局偏好；看板开着时顺便刷新内容
+function startSync($: any, st: St) {
+  st.sync?.cancel()
+  st.sync = $.clock.every(SYNC_MS, async () => {
+    const want = (await $.store.get(PREF)) === true
+    const isUp = (await $.ui.panes()).some(p => p.id === PANE)
+    if (want && !isUp) await $.ui.open({ id: PANE, title: '最近 session' })
+    if (!want && isUp) await $.ui.close({ id: PANE })
+    // 自己处于「后台运行中」时，跟踪后台 subagent 还剩几个；全部跑完就转成完成（唤醒后的那一轮会再正式提示）
+    if (st.rec?.state === 'background') {
+      const bg = await liveAgents($)
+      if (bg !== st.rec.bg) {
+        Object.assign(st.rec, bg > 0 ? { bg } : { bg: 0, state: 'done', at: await $.clock.now() })
+        await $.store.set(key(st.rec.id), st.rec)
+      }
+    }
+    // token 用量：每 USAGE_MS 刷新一次（今天 + 当前选中的区间）；扫描有文件锁，多个 session 不会重复扫
+    const now = await $.clock.now()
+    if (!st.usageBusy && now - st.usageAt > USAGE_MS) {
+      st.usageBusy = true
+      const range = String((await $.store.get(RANGE)) ?? 'today')
+      const res = await fetchUsage($, Array.from(new Set(['today', range])), true)
+      if (res) { st.usage = res; st.usageAt = now }
+      st.usageBusy = false
+    }
+    $.ui.invalidate('ui.render')     // 横条也要跟上其他 session 的完成提示
+  })
+}
+
 export const register: Register = (on, options) => {
   const cfg = readCfg(options)
-  let rec: Rec | null = null
-  let interactive = false
-  let tracked = false            // 只有「有窗口」的 session 才记录和提醒
-  let sync: { cancel: () => void } | null = null
-  let usage: any = null          // 最近一次统计结果（含 today 和当前区间）
-  let usageAt = 0
-  let usageBusy = false
-  let query = ''                 // 看板会话页的搜索词（只在本 session 的看板里有效）
+  const st: St = { rec: null, interactive: false, tracked: false, sync: null, usage: null, usageAt: 0, usageBusy: false,
+    query: '', cwd: '', inTurn: false, retry: null, setupP: null }
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
-    interactive = e.isInteractive
-    const id = await $.session.id()
-    const now = await $.clock.now()
-    const found = await lookup($, id)
-    tracked = interactive || !!found.localId
-    if (!tracked) return started  // 无窗口的定时任务：什么都不做
-
-    // 命令注册单独兜底：和内置命令重名会被引擎拒绝（曾因 /usage 撞名导致后面的初始化全部没跑）
-    try { await $.command.register({ name: 'recent', description: '打开 / 收起「最近 session」看板' }) } catch { /* 忽略 */ }
-    try { await $.command.register({ name: 'tokens', description: 'token 用量。/tokens 打开用量页；/tokens 2026-09-01 2026-09-30 看指定区间' }) }
-    catch { try { await $.command.register({ name: 'radar-usage', description: 'token 用量（/tokens 被占用时的备用名）' }) } catch { /* 忽略 */ } }
-    const old = (await $.store.get(key(id))) as Rec | undefined
-    rec = old ?? { id, project: (e.cwd || '').split('/').filter(Boolean).pop() || '~', title: '', state: 'done', at: now, startedAt: now, seconds: 0, tools: 0, turns: 0 }
-    if (found.localId) rec.localId = found.localId
-    if (found.title) rec.title = found.title
-    await $.store.set(key(rec.id), rec)
-
-    // 清理：过期记录 + 以前误记的无窗口记录（没有侧栏 ID 的）
-    for (const k of await $.store.keys()) {
-      if (!k.startsWith('s:')) continue
-      const r = (await $.store.get(k)) as Rec | undefined
-      const pinnedIds = ((await $.store.get(PINS)) as string[] | undefined) ?? []   // 置顶的不过期
-      if (!r || (now - r.at > cfg.keepDays * 86400_000 && !pinnedIds.includes(r.id)) || (!r.localId && r.id !== id)) await $.store.delete(k)
+    st.interactive = e.isInteractive
+    st.cwd = e.cwd || ''
+    if (!(await ensureTracked($, st, cfg))) {
+      let tries = 0
+      st.retry?.cancel()
+      st.retry = $.clock.every(5000, async () => {
+        if ((await ensureTracked($, st, cfg)) || ++tries >= 24) { st.retry?.cancel(); st.retry = null }
+      })
     }
-    for (const k of await $.store.keys()) {   // 对应记录已删除的「已看过」标记
-      if ((k.startsWith('seen:') || k.startsWith('hide:')) && (await $.store.get(`s:${k.slice(5)}`)) === undefined) await $.store.delete(k)
-    }
-
-    // 每隔 SYNC_MS 对齐一次：看板开关跟随全局偏好；看板开着时顺便刷新内容
-    sync?.cancel()
-    sync = $.clock.every(SYNC_MS, async () => {
-      const want = (await $.store.get(PREF)) === true
-      const isUp = (await $.ui.panes()).some(p => p.id === PANE)
-      if (want && !isUp) await $.ui.open({ id: PANE, title: '最近 session' })
-      if (!want && isUp) await $.ui.close({ id: PANE })
-      // 自己处于「后台运行中」时，跟踪后台 subagent 还剩几个；全部跑完就转成完成（唤醒后的那一轮会再正式提示）
-      if (rec?.state === 'background') {
-        const bg = await liveAgents($)
-        if (bg !== rec.bg) {
-          Object.assign(rec, bg > 0 ? { bg } : { bg: 0, state: 'done', at: await $.clock.now() })
-          await $.store.set(key(rec.id), rec)
-        }
-      }
-      // token 用量：每 USAGE_MS 刷新一次（今天 + 当前选中的区间）；扫描有文件锁，多个 session 不会重复扫
-      const now = await $.clock.now()
-      if (!usageBusy && now - usageAt > USAGE_MS) {
-        usageBusy = true
-        const range = String((await $.store.get(RANGE)) ?? 'today')
-        const res = await fetchUsage($, Array.from(new Set(['today', range])), true)
-        if (res) { usage = res; usageAt = now }
-        usageBusy = false
-      }
-      $.ui.invalidate('ui.render')     // 横条也要跟上其他 session 的完成提示
-    })
     return started
   })
 
   on('prompt.submit', async ($, e, next) => {
-    if (tracked && rec) {
+    st.inTurn = true
+    await ensureTracked($, st, cfg)
+    if (st.tracked && st.rec) {
       const now = await $.clock.now()
       const text = String((e as any).text ?? '').replace(/\s+/g, ' ').trim()
-      if (!rec.title) rec.title = text.slice(0, 40)
+      if (!st.rec.title) st.rec.title = text.slice(0, 40)
       // 斜杠命令、空输入不覆盖上一次的摘要
-      if (text && !text.startsWith('/') && !isNoise(text)) rec.ask = text.length > 36 ? `${text.slice(0, 36)}…` : text
-      Object.assign(rec, { state: 'running', startedAt: now, at: now, tools: 0 })
-      await $.store.set(key(rec.id), rec)
-      await $.store.set(seenKey(rec.id), now)   // 你已经在这个 session 里操作了，别处不用再提示它
+      if (text && !text.startsWith('/') && !isNoise(text)) st.rec.ask = text.length > 36 ? `${text.slice(0, 36)}…` : text
+      Object.assign(st.rec, { state: 'running', startedAt: now, at: now, tools: 0 })
+      await $.store.set(key(st.rec.id), st.rec)
+      await $.store.set(seenKey(st.rec.id), now)   // 你已经在这个 session 里操作了，别处不用再提示它
     }
     const out = next(e)
     // 发送消息时刷新一次所有 session 的名字（不挡住消息发送）
     const tt = await refreshTitles($)
-    if (tt && rec && tt[rec.id] && tt[rec.id] !== rec.title) { rec.title = tt[rec.id]; await $.store.set(key(rec.id), rec) }
+    if (tt && st.rec && tt[st.rec.id] && tt[st.rec.id] !== st.rec.title) { st.rec.title = tt[st.rec.id]; await $.store.set(key(st.rec.id), st.rec) }
     $.ui.invalidate('ui.render')
     return out
   })
 
   // 后台任务跑完会唤醒 session 再跑一轮，这种回合没有 prompt.submit，也要显示成运行中
   on('turn.start', async ($, e, next) => {
-    if (tracked && rec && rec.state !== 'running') {
+    if (!(e as any).agentId) st.inTurn = true
+    await ensureTracked($, st, cfg)
+    if (st.tracked && st.rec && st.rec.state !== 'running') {
       const now = await $.clock.now()
-      Object.assign(rec, { state: 'running', startedAt: now, at: now, tools: 0 })
-      await $.store.set(key(rec.id), rec)
+      Object.assign(st.rec, { state: 'running', startedAt: now, at: now, tools: 0 })
+      await $.store.set(key(st.rec.id), st.rec)
     }
     return next(e)
   })
 
   on('tool.call', async ($, e, next) => {
-    if (rec) rec.tools += 1
+    if (st.rec) st.rec.tools += 1
     return next(e)
   })
 
   on('turn.complete', async ($, e, next) => {
     const out = await next(e)
-    if (!rec || e.agentId) return out            // 只管主回合，子 agent 的回合不提醒
+    if (e.agentId) return out                    // 只管主回合，子 agent 的回合不提醒
+    st.inTurn = false
+    await ensureTracked($, st, cfg)
+    if (!st.rec) return out
     await loadTitles($)
-    const found = await lookup($, rec.id)
-    if (found.localId) rec.localId = found.localId
-    if (found.title) rec.title = found.title
-    tracked = interactive || !!rec.localId
-    if (!tracked) return out
+    const found = await lookup($, st.rec.id)
+    if (found.localId) st.rec.localId = found.localId
+    if (found.title) st.rec.title = found.title
+    st.tracked = st.interactive || !!st.rec.localId
+    if (!st.tracked) return out
 
     const seconds = Math.round(e.durationMs / 1000)
     const bg = await liveAgents($)
     // 主回合答完但后台 subagent 还在跑 → 不算完成；等它们跑完、session 被唤醒再答完一轮时才提示「完成」
     const state: Rec['state'] = e.reason === 'answer' ? (bg > 0 ? 'background' : 'done') : e.reason === 'aborted' ? 'aborted' : 'error'
-    Object.assign(rec, { state, bg, seconds, at: await $.clock.now(), turns: rec.turns + 1 })
-    await $.store.set(key(rec.id), rec)
+    Object.assign(st.rec, { state, bg, seconds, at: await $.clock.now(), turns: st.rec.turns + 1 })
+    await $.store.set(key(st.rec.id), st.rec)
     // 跑完时读一次 App 的焦点：你正看着它跑完的，不算「没看」，不进别的 session 的横条
-    if (await refreshTitles($) && focusedId() === rec.id) await $.store.set(seenKey(rec.id), rec.at)
+    if (await refreshTitles($) && focusedId() === st.rec.id) await $.store.set(seenKey(st.rec.id), st.rec.at)
 
     // 三行：是什么状态的哪个 session / 在哪个文件夹、花了多久 / 你最后让它做的事
-    const head = `${ICON[state]} ${LABEL[state]}｜${nameOf(rec)}`
-    const meta = `📁 ${rec.project} · 用时 ${dur(seconds)} · 工具 ${rec.tools} 次${bg ? ` · 后台 ${bg} 个任务还在跑` : ''}`
-    const ask = rec.ask ? `你说：「${rec.ask}」` : ''
+    const head = `${ICON[state]} ${LABEL[state]}｜${nameOf(st.rec)}`
+    const meta = `📁 ${st.rec.project} · 用时 ${dur(seconds)} · 工具 ${st.rec.tools} 次${bg ? ` · 后台 ${bg} 个任务还在跑` : ''}`
+    const ask = st.rec.ask ? `你说：「${st.rec.ask}」` : ''
     $.ui.toast([head, ask, meta].filter(Boolean).join('　'), { timeoutMs: 8000 })
     // 值得提醒：后台还在跑的先不响（跑完那轮再提示）；完成得很快的不打扰（你多半正盯着看）；出错/中断总是提醒
     const notify = state !== 'background' && (seconds >= cfg.notifyMinSeconds || state !== 'done')
@@ -276,7 +320,7 @@ export const register: Register = (on, options) => {
     if (notify && cfg.notify) {
       // 文字通知：不带声音（声音由下面直接播放）。terminal-notifier 的通知点一下直接打开这个 session；
       // osascript 的通知点了只会打开「脚本编辑器」，所以只作没装 terminal-notifier 时的退路
-      const url = rec.localId ? `claude://code/continue?session=${rec.localId}&source=desktop_action` : ''
+      const url = st.rec.localId ? `claude://code/continue?session=${st.rec.localId}&source=desktop_action` : ''
       try {
         // 找 terminal-notifier（Homebrew 两种位置都试）；通知右侧的 Claude 图标从本机 Claude.app 生成一次后缓存
         notifyRc = (await $.process.run(['/bin/sh', '-c',
@@ -286,7 +330,7 @@ export const register: Register = (on, options) => {
           '[ -n "$c" ] && sips -s format png -Z 128 "$c" --out "$i" >/dev/null 2>&1; }; ' +
           '[ -f "$i" ] && set -- "$@" -contentImage "$i"; exec "$n" "$@"', 'sh',
           '-title', head, '-subtitle', meta, '-message', ask || '（点击打开这个 session）',
-          '-group', `session-radar:${rec.id}`,
+          '-group', `session-radar:${st.rec.id}`,
           ...(url ? ['-open', url] : ['-activate', 'com.anthropic.claudefordesktop']),
         ], { timeoutMs: 10000 })).exitCode
       } catch { notifyRc = -2 }
@@ -308,12 +352,12 @@ export const register: Register = (on, options) => {
         soundRc = r.exitCode; soundErr = (r.stderr || '').slice(0, 120)
       } catch (err) { soundRc = -2; soundErr = String(err).slice(0, 120) }
     }
-    if (notify && cfg.speak) $.ui.speak(`${nameOf(rec)} ${LABEL[state]}`).catch(() => {})
+    if (notify && cfg.speak) $.ui.speak(`${nameOf(st.rec)} ${LABEL[state]}`).catch(() => {})
     // 诊断日志：最近 50 条，存在共享存储的 log 键里
     const log = ((await $.store.get(LOG)) as any[] | undefined) ?? []
-    log.push({ at: await $.clock.now(), name: nameOf(rec), state, seconds, notify, notifyRc, soundRc, soundErr })
+    log.push({ at: await $.clock.now(), name: nameOf(st.rec), state, seconds, notify, notifyRc, soundRc, soundErr })
     await $.store.set(LOG, log.slice(-50))
-    usageAt = 0                      // 这一轮刚花了 token：下一个同步周期立刻刷新用量
+    st.usageAt = 0                      // 这一轮刚花了 token：下一个同步周期立刻刷新用量
     $.ui.invalidate('ui.render')
     return out
   })
@@ -339,7 +383,7 @@ export const register: Register = (on, options) => {
     await setPane($, true)
     const range = String((await $.store.get(RANGE)) ?? 'today')
     const res = await fetchUsage($, Array.from(new Set(['today', range])), false)
-    if (res) { usage = res; usageAt = await $.clock.now() }
+    if (res) { st.usage = res; st.usageAt = await $.clock.now() }
     $.ui.invalidate('ui.render')
     return { text: m ? `已打开用量页：${m[1]} ~ ${m[2]}` : '已打开用量页。指定区间：/tokens 2026-09-01 2026-09-30' }
   })
@@ -347,12 +391,12 @@ export const register: Register = (on, options) => {
   // 输入框正上方的横条：最近 1 小时的状况摘要 + 看板开关按钮
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     await loadTitles($)
-    if (!tracked || e.props.hasSurvey) return next(e)   // 有问卷占用横条时让路
+    if (!st.tracked || e.props.hasSurvey) return next(e)   // 有问卷占用横条时让路
     const below = await next(e)   // 下层插件（比如 voice-reply）画的内容，包在自己下面一起显示
     const { Box, Text, Button } = $.ui.resolve(e)
     const now = await $.clock.now()
     const isOpen = (await $.store.get(PREF)) === true
-    const me = rec?.id
+    const me = st.rec?.id
     const n = { done: 0, error: 0, aborted: 0, running: 0, background: 0 }
     const notices: Rec[] = []
     for (const k of await $.store.keys()) {
@@ -394,8 +438,8 @@ export const register: Register = (on, options) => {
           {n.error + n.aborted > 0 && <Text color="red">❌{n.error + n.aborted} </Text>}
           {n.running > 0 && <Text color="yellow">⏳{n.running} </Text>}
           {n.background > 0 && <Text color="cyan">🔄{n.background} </Text>}
-          {usage?.ranges?.today && (
-            <Text dimColor>  · 今天 {fmtTok(usage.ranges.today.totals.total)} token ≈ {fmtUsd(usage.ranges.today.totals.cost)}</Text>
+          {st.usage?.ranges?.today && (
+            <Text dimColor>  · 今天 {fmtTok(st.usage.ranges.today.totals.total)} token ≈ {fmtUsd(st.usage.ranges.today.totals.cost)}</Text>
           )}
         </Box>
         {below ? below : null}
@@ -407,7 +451,7 @@ export const register: Register = (on, options) => {
     await loadTitles($)
     const { Box, Text, Button, Input } = $.ui.resolve(e) as any
     const now = await $.clock.now()
-    const me = rec?.id
+    const me = st.rec?.id
     const tab = String((await $.store.get(TAB)) ?? 'sessions')
     const tabs = (
       <Box key="tabs" flexDirection="row" marginBottom={1}>
@@ -417,16 +461,16 @@ export const register: Register = (on, options) => {
         <Button key="tab-u" label={tab === 'usage' ? '● 用量' : '用量'} onPress={async () => {
           await $.store.set(TAB, 'usage'); $.ui.invalidate('ui.render')
         }} />
-        {tab === 'sessions' && Input && <Input key="search" placeholder="🔍 搜索名字 / 文件夹 / 你说" value={query} submitLabel="搜索"
-          onInput={(v: string) => { query = v; $.ui.invalidate('ui.render') }}
-          onSubmit={(v: string) => { query = v; $.ui.invalidate('ui.render') }} />}
+        {tab === 'sessions' && Input && <Input key="search" placeholder="🔍 搜索名字 / 文件夹 / 你说" value={st.query} submitLabel="搜索"
+          onInput={(v: string) => { st.query = v; $.ui.invalidate('ui.render') }}
+          onSubmit={(v: string) => { st.query = v; $.ui.invalidate('ui.render') }} />}
       </Box>
     )
 
     // ── 用量页 ──────────────────────────────────────────
     if (tab === 'usage') {
       const range = String((await $.store.get(RANGE)) ?? 'today')
-      const u = usage?.ranges?.[range]
+      const u = st.usage?.ranges?.[range]
       const width = Math.max(20, (e.props?.bodyColumns ?? 60) - 4)
       const barMax = Math.max(8, Math.min(24, width - 30))
       const days: any[] = u?.byDay ?? []
@@ -440,13 +484,13 @@ export const register: Register = (on, options) => {
               <Button key={`r-${k}`} label={range === k ? `●${label}` : label} onPress={async () => {
                 await $.store.set(RANGE, k)
                 const res = await fetchUsage($, Array.from(new Set(['today', k])), false)
-                if (res) { usage = res; usageAt = await $.clock.now() }
+                if (res) { st.usage = res; st.usageAt = await $.clock.now() }
                 $.ui.invalidate('ui.render')
               }} />
             ))}
             <Button key="r-refresh" label="↻" onPress={async () => {
               const res = await fetchUsage($, Array.from(new Set(['today', range])), true)
-              if (res) { usage = res; usageAt = await $.clock.now() }
+              if (res) { st.usage = res; st.usageAt = await $.clock.now() }
               $.ui.invalidate('ui.render')
             }} />
           </Box>
@@ -494,7 +538,7 @@ export const register: Register = (on, options) => {
           )}
           {u && u.unpriced.length > 0 && <Text key="unpriced" color="yellow">未计价模型：{u.unpriced.join(', ')}</Text>}
           <Text key="foot" dimColor wrap="wrap">
-            按 Anthropic 官方 API 标价折算（Max 订阅非实际账单）· 已去重{usage?.lastScan ? ` · 更新于 ${age(now - usage.lastScan)}` : ''}
+            按 Anthropic 官方 API 标价折算（Max 订阅非实际账单）· 已去重{st.usage?.lastScan ? ` · 更新于 ${age(now - st.usage.lastScan)}` : ''}
           </Text>
         </Box>
       )
@@ -537,7 +581,7 @@ export const register: Register = (on, options) => {
     )
     const EMPTY: Record<string, string> = { todo: '没有待处理的 session 🎉', run: '现在没有在跑的 session', pin: '还没有置顶。点每行末尾的 ☆ 钉住常用的 session', all: '还没有记录。跑一轮对话后这里会出现。' }
     // 有搜索词时：在全部 session 里按名字 / 文件夹 / 你说 / 侧栏标题过滤（不分标签页，置顶的排前）
-    const q = query.trim().toLowerCase()
+    const q = st.query.trim().toLowerCase()
     const hit = (r: Rec) => [nameOf(r), titleOf(r), r.project, r.ask ?? ''].some(x => x.toLowerCase().includes(q))
     const list = q ? groups.all.filter(hit) : groups[sub]
     const rows = list.slice(0, Math.max(3, (e.viewport?.rows ?? 30) - 6))
@@ -548,8 +592,8 @@ export const register: Register = (on, options) => {
         {tabs}
         {q
           ? <Box key="searching" flexDirection="row" marginBottom={1}>
-              <Text dimColor>搜索「{query.trim()}」：{list.length} 个  </Text>
-              <Button key="clear-q" label="× 清空" onPress={() => { query = ''; $.ui.invalidate('ui.render') }} />
+              <Text dimColor>搜索「{st.query.trim()}」：{list.length} 个  </Text>
+              <Button key="clear-q" label="× 清空" onPress={() => { st.query = ''; $.ui.invalidate('ui.render') }} />
             </Box>
           : subTabs}
         {rows.length === 0 && <Text dimColor>{q ? '没有匹配的 session' : EMPTY[sub]}</Text>}
