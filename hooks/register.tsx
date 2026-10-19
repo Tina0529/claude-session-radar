@@ -29,13 +29,35 @@ type Rec = {
   bg?: number                    // 主回合结束后仍在后台跑的 subagent 数
   at: number; startedAt: number; seconds: number; tools: number; turns: number
   ask?: string                   // 这一轮你最后发的话（摘要），通知里用来认出是哪个 session
+  need?: 'decide' | 'send'       // 答完了，但 decide = 在等你拍板（提问 / 确认 / 选择 / 卡住）；send = 成果做好了，只差你发出去
 }
 
 const ICON: Record<Rec['state'], string> = { running: '⏳', background: '🔄', done: '✅', aborted: '⏹', error: '❌' }
 const LABEL: Record<Rec['state'], string> = { running: '运行中', background: '后台运行中', done: '完成', aborted: '已中断', error: '出错' }
+// 「完成」再细分：等你决定 / 待你发出（每轮答完时由小模型读回答判断）
+const iconOf = (r: Rec) => (r.state === 'done' && r.need === 'decide' ? '🔴' : r.state === 'done' && r.need === 'send' ? '📤' : ICON[r.state])
+const labelOf = (r: Rec) => (r.state === 'done' && r.need === 'decide' ? '等你决定' : r.state === 'done' && r.need === 'send' ? '待你发出' : LABEL[r.state])
+// 越靠前越该先处理：等你决定 → 出错 / 中断 → 待你发出 → 完成
+const urgency = (r: Rec) => (r.state === 'done' && r.need === 'decide' ? 0 : r.state === 'error' || r.state === 'aborted' ? 1 : r.state === 'done' && r.need === 'send' ? 2 : 3)
+
+const TRIAGE_SYSTEM = [
+  '你判断 AI 编程助手刚答完的一轮回答，用户接下来要做什么。只输出一个词：DECIDE、SEND 或 DONE。',
+  'DECIDE：回答在等用户——向用户提问、请用户确认 / 选择 / 批准、问「要不要我…」，或者卡在需要用户处理的错误、权限、登录、手动操作上。',
+  'SEND：成果已经做好，只差用户自己发出去 / 提交 / 发布（例如写好的邮件、消息、帖子草稿，或表单已填好、等用户点发表）。',
+  'DONE：任务完成，没有需要用户决定或操作的事；只是顺带提一句「有需要可以再说」不算 DECIDE。',
+].join('\n')
+async function triage($: any, answer: string, model: string): Promise<Rec['need'] | undefined> {
+  const text = String(answer || '').trim()
+  if (!text) return undefined
+  try {
+    const r: any = await $.model.complete({ model, system: TRIAGE_SYSTEM, prompt: text.slice(-4000), maxTokens: 10, effort: 'low', timeoutMs: 20000 })
+    const v = String(r?.text || '').toUpperCase()
+    return v.includes('DECIDE') ? 'decide' : v.includes('SEND') ? 'send' : undefined
+  } catch { return undefined }
+}
 
 // 用户配置（plugin.json 的 userConfig；`claude plugin configure` 修改），缺省值与 plugin.json 保持一致
-type Cfg = { doneSound: string; errorSound: string; sound: boolean; notify: boolean; notifyMinSeconds: number; speak: boolean; keepDays: number }
+type Cfg = { doneSound: string; errorSound: string; sound: boolean; notify: boolean; notifyMinSeconds: number; speak: boolean; keepDays: number; triage: boolean; triageModel: string }
 function readCfg(o: any): Cfg {
   const num = (v: any, d: number) => (Number.isFinite(Number(v)) && Number(v) >= 0 ? Number(v) : d)
   const bool = (v: any, d: boolean) => (v === undefined || v === '' ? d : v === true || v === 'true')
@@ -47,6 +69,8 @@ function readCfg(o: any): Cfg {
     notifyMinSeconds: num(o?.notifyMinSeconds, 20),
     speak: bool(o?.speak, false),
     keepDays: num(o?.keepDays, 7) || 7,
+    triage: bool(o?.triage, true),
+    triageModel: String(o?.triageModel || 'haiku'),
   }
 }
 
@@ -258,7 +282,7 @@ export const register: Register = (on, options) => {
       if (!st.rec.title) st.rec.title = text.slice(0, 40)
       // 斜杠命令、空输入不覆盖上一次的摘要
       if (text && !text.startsWith('/') && !isNoise(text)) st.rec.ask = text.length > 36 ? `${text.slice(0, 36)}…` : text
-      Object.assign(st.rec, { state: 'running', startedAt: now, at: now, tools: 0 })
+      Object.assign(st.rec, { state: 'running', startedAt: now, at: now, tools: 0, need: undefined })
       await $.store.set(key(st.rec.id), st.rec)
       await $.store.set(seenKey(st.rec.id), now)   // 你已经在这个 session 里操作了，别处不用再提示它
     }
@@ -276,7 +300,7 @@ export const register: Register = (on, options) => {
     await ensureTracked($, st, cfg)
     if (st.tracked && st.rec && st.rec.state !== 'running') {
       const now = await $.clock.now()
-      Object.assign(st.rec, { state: 'running', startedAt: now, at: now, tools: 0 })
+      Object.assign(st.rec, { state: 'running', startedAt: now, at: now, tools: 0, need: undefined })
       await $.store.set(key(st.rec.id), st.rec)
     }
     return next(e)
@@ -304,13 +328,15 @@ export const register: Register = (on, options) => {
     const bg = await liveAgents($)
     // 主回合答完但后台 subagent 还在跑 → 不算完成；等它们跑完、session 被唤醒再答完一轮时才提示「完成」
     const state: Rec['state'] = e.reason === 'answer' ? (bg > 0 ? 'background' : 'done') : e.reason === 'aborted' ? 'aborted' : 'error'
-    Object.assign(st.rec, { state, bg, seconds, at: await $.clock.now(), turns: st.rec.turns + 1 })
+    // 正常答完时，让小模型读一下回答：是在等你拍板，还是只差你发出去，还是真做完了
+    const need = state === 'done' && cfg.triage ? await triage($, String((e as any).answer ?? ''), cfg.triageModel) : undefined
+    Object.assign(st.rec, { state, bg, seconds, at: await $.clock.now(), turns: st.rec.turns + 1, need })
     await $.store.set(key(st.rec.id), st.rec)
     // 跑完时读一次 App 的焦点：你正看着它跑完的，不算「没看」，不进别的 session 的横条
     if (await refreshTitles($) && focusedId() === st.rec.id) await $.store.set(seenKey(st.rec.id), st.rec.at)
 
     // 三行：是什么状态的哪个 session / 在哪个文件夹、花了多久 / 你最后让它做的事
-    const head = `${ICON[state]} ${LABEL[state]}｜${nameOf(st.rec)}`
+    const head = `${iconOf(st.rec)} ${labelOf(st.rec)}｜${nameOf(st.rec)}`
     const meta = `📁 ${st.rec.project} · 用时 ${dur(seconds)} · 工具 ${st.rec.tools} 次${bg ? ` · 后台 ${bg} 个任务还在跑` : ''}`
     const ask = st.rec.ask ? `你说：「${st.rec.ask}」` : ''
     $.ui.toast([head, ask, meta].filter(Boolean).join('　'), { timeoutMs: 8000 })
@@ -352,7 +378,7 @@ export const register: Register = (on, options) => {
         soundRc = r.exitCode; soundErr = (r.stderr || '').slice(0, 120)
       } catch (err) { soundRc = -2; soundErr = String(err).slice(0, 120) }
     }
-    if (notify && cfg.speak) $.ui.speak(`${nameOf(st.rec)} ${LABEL[state]}`).catch(() => {})
+    if (notify && cfg.speak) $.ui.speak(`${nameOf(st.rec)} ${labelOf(st.rec)}`).catch(() => {})
     // 诊断日志：最近 50 条，存在共享存储的 log 键里
     const log = ((await $.store.get(LOG)) as any[] | undefined) ?? []
     log.push({ at: await $.clock.now(), name: nameOf(st.rec), state, seconds, notify, notifyRc, soundRc, soundErr })
@@ -409,9 +435,8 @@ export const register: Register = (on, options) => {
       if (r.at <= Number((await $.store.get(hideKey(r.id))) ?? 0)) continue
       notices.push(r)
     }
-    // 出错 / 中断的排前面，其余按跑完的先后
-    const bad = (r: Rec) => Number(r.state === 'error' || r.state === 'aborted')
-    notices.sort((a, b) => bad(b) - bad(a) || b.at - a.at)
+    // 等你决定 → 出错 / 中断 → 待你发出 → 完成，同类按跑完的先后
+    notices.sort((a, b) => urgency(a) - urgency(b) || b.at - a.at)
     return (
       <Box flexDirection="column">
         {notices.slice(0, NOTICE_MAX).map(r => (
@@ -420,7 +445,7 @@ export const register: Register = (on, options) => {
               await $.store.set(seenKey(r.id), r.at)
               void $.process.run(['open', `claude://code/continue?session=${r.localId}&source=desktop_action`])
               $.ui.invalidate('ui.render')
-            }}>{[<Text key="dot" color="yellow">● </Text>, <Text key="lb">{`${ICON[r.state]} ${nameOf(r)} · ${LABEL[r.state]} ↗`}</Text>].filter(Boolean)}</Button>
+            }}>{[<Text key="dot" color="yellow">● </Text>, <Text key="lb">{`${iconOf(r)} ${nameOf(r)} · ${labelOf(r)} ↗`}</Text>].filter(Boolean)}</Button>
             <Text dimColor wrap="truncate-end">  📁 {r.project} · {age(now - r.at)}</Text>
             <Button key={`dismiss-${r.id}`} label="×" onPress={async () => {
               await $.store.set(seenKey(r.id), r.at)
@@ -554,7 +579,7 @@ export const register: Register = (on, options) => {
     const pins = ((await $.store.get(PINS)) as string[] | undefined) ?? []
     const pinned = (r: Rec) => pins.includes(r.id)
     all.sort((a, b) => b.at - a.at)
-    const color = (s: Rec['state']) => (s === 'done' ? 'green' : s === 'running' ? 'yellow' : s === 'background' ? 'cyan' : s === 'error' ? 'red' : 'gray')
+    const color = (r: Rec) => (r.state === 'done' ? (r.need === 'decide' ? 'red' : r.need === 'send' ? 'magenta' : 'green') : r.state === 'running' ? 'yellow' : r.state === 'background' ? 'cyan' : r.state === 'error' ? 'red' : 'gray')
 
     // 跑完后还没回去看过（一天内）的 session 标黄点 = 待处理（和横条的完成提示共用「已看过」标记）
     const unseen = new Set<string>()
@@ -562,7 +587,8 @@ export const register: Register = (on, options) => {
       if (await isUnseen($, r, me, now)) unseen.add(r.id)
     }
     const groups: Record<string, Rec[]> = {
-      todo: all.filter(r => unseen.has(r.id)),
+      // 待处理 = 跑完没看过的 + 还在等你决定的（看过但还没回它），等你决定的排前面
+      todo: all.filter(r => unseen.has(r.id) || (r.id !== me && r.state === 'done' && r.need === 'decide')).sort((a, b) => urgency(a) - urgency(b) || b.at - a.at),
       run: all.filter(r => busy(r.state)),
       pin: all.filter(pinned),
       all: [...all.filter(pinned), ...all.filter(r => !pinned(r))],
@@ -603,7 +629,7 @@ export const register: Register = (on, options) => {
           // 标题行：整行就是按钮，点名字直接切过去；年龄放在按钮里，所以必须给固定 key
           const title = [
             unseen.has(r.id) && <Text key="dot" color="yellow">● </Text>,
-            <Text key="st" color={color(r.state)} bold>{ICON[r.state]} {r.state === 'done' ? '' : `${LABEL[r.state]}${r.state === 'background' && r.bg ? ` ${r.bg}` : ''} `}</Text>,
+            <Text key="st" color={color(r)} bold>{iconOf(r)} {r.state === 'done' && !r.need ? '' : `${labelOf(r)}${r.state === 'background' && r.bg ? ` ${r.bg}` : ''} `}</Text>,
             <Text key="nm" bold>{nameOf(r)}</Text>,
             r.id === me && <Text key="me" color="cyan"> (当前)</Text>,
             <Text key="age" dimColor>  {age(now - r.at)}{canOpen ? '  ↗' : ''}</Text>,

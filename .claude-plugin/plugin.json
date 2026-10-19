@@ -1,12 +1,23 @@
 {
   "name": "session-radar",
-  "version": "1.4.1",
+  "version": "1.5.0",
   "description": "Claude Code desktop (macOS) mod: per-session completion notifications that jump to the session on click, a custom sound, a 'recent sessions' pane with background-subagent status, and token usage / cost stats.",
-  "author": { "name": "Tina0529", "url": "https://github.com/Tina0529" },
+  "author": {
+    "name": "Tina0529",
+    "url": "https://github.com/Tina0529"
+  },
   "homepage": "https://github.com/Tina0529/claude-session-radar",
   "repository": "https://github.com/Tina0529/claude-session-radar",
   "license": "MIT",
-  "keywords": ["mod", "notification", "sessions", "usage", "tokens", "macos", "desktop"],
+  "keywords": [
+    "mod",
+    "notification",
+    "sessions",
+    "usage",
+    "tokens",
+    "macos",
+    "desktop"
+  ],
   "userConfig": {
     "doneSound": {
       "type": "string",
@@ -49,6 +60,18 @@
       "title": "Keep days / 记录保留天数",
       "description": "How many days of sessions the pane keeps.",
       "default": 7
+    },
+    "triage": {
+      "type": "boolean",
+      "title": "Triage / 区分等你决定",
+      "description": "When a turn finishes, a small model reads the answer and marks the session 🔴 waiting for your decision, 📤 ready for you to send, or ✅ done.",
+      "default": true
+    },
+    "triageModel": {
+      "type": "string",
+      "title": "Triage model / 判断用的模型",
+      "description": "Model used for the triage (uses your own Claude login).",
+      "default": "haiku"
     }
   }
 }
