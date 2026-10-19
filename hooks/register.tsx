@@ -5,7 +5,7 @@ const SYNC_MS = 2000            // 各 session 对齐「看板开/关」的间�
 const PANE = 'session-radar'
 const PREF = 'pref:paneOpen'    // 看板开关状态：跨 session 共享，切换 session 时保持
 const NOTICE_MAX = 3            // 横条上的快速切换栏：窄窗口一列最多几个「跑完还没看」的 session（够宽时两列，翻倍）
-const TWO_COL_MIN = 100         // 横条宽度（字符列数）达到这个值就排成两列
+const TWO_COL_MIN = 80          // 横条宽度（字符列数）达到这个值就排成两列
 const hideKey = (id: string) => `hide:${id}`   // 在横条上点 × 收起（这个 session 下次跑完会再出现）
 const seenKey = (id: string) => `seen:${id}`   // 已看过的完成提示（跨 session 共享，点过一处其他地方也消失）
 const LOG = 'log'               // 诊断日志：每轮结束是否通知、播音结果
@@ -462,19 +462,22 @@ export const register: Register = (on, options) => {
           ))}
         </Box>
         {notices.length > max && <Text key="more" dimColor>  还有 {notices.length - max} 个没看，在看板「待处理」里</Text>}
-        <Box flexDirection="row">
-          <Button key="radar-toggle" label={isOpen ? '▾ 收起看板' : '▸ 最近 session'}
+        {/* 统计行：左边是自己的统计，右边接下层插件（比如 voice-reply 的「🔊 朗读 · 声音」），窄时自动换行 */}
+        <Box key="stats-row" flexDirection="row" flexWrap="wrap" justifyContent="space-between">
+        <Box key="stats" flexDirection="row">
+          <Button key="radar-toggle" label={isOpen ? '▾ 看板' : '▸ 看板'}
             onPress={() => setPane($, !isOpen)} />
-          <Text dimColor>  近1小时 </Text>
+          <Text dimColor> 近1小时 </Text>
           <Text color="green">✅{n.done} </Text>
           {n.error + n.aborted > 0 && <Text color="red">❌{n.error + n.aborted} </Text>}
           {n.running > 0 && <Text color="yellow">⏳{n.running} </Text>}
           {n.background > 0 && <Text color="cyan">🔄{n.background} </Text>}
           {st.usage?.ranges?.today && (
-            <Text dimColor>  · 今天 {fmtTok(st.usage.ranges.today.totals.total)} token ≈ {fmtUsd(st.usage.ranges.today.totals.cost)}</Text>
+            <Text dimColor> · 今天 {fmtTok(st.usage.ranges.today.totals.total)} token ≈ {fmtUsd(st.usage.ranges.today.totals.cost)}</Text>
           )}
         </Box>
-        {below ? below : null}
+        {below ? <Box key="below">{below}</Box> : null}
+        </Box>
       </Box>
     )
   })
