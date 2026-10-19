@@ -4,7 +4,8 @@ import type { Register } from 'claude-code'
 const SYNC_MS = 2000            // 各 session 对齐「看板开/关」的间隔
 const PANE = 'session-radar'
 const PREF = 'pref:paneOpen'    // 看板开关状态：跨 session 共享，切换 session 时保持
-const NOTICE_MAX = 3            // 横条上的快速切换栏：最多列几个「跑完还没看」的 session
+const NOTICE_MAX = 3            // 横条上的快速切换栏：窄窗口一列最多几个「跑完还没看」的 session（够宽时两列，翻倍）
+const TWO_COL_MIN = 100         // 横条宽度（字符列数）达到这个值就排成两列
 const hideKey = (id: string) => `hide:${id}`   // 在横条上点 × 收起（这个 session 下次跑完会再出现）
 const seenKey = (id: string) => `seen:${id}`   // 已看过的完成提示（跨 session 共享，点过一处其他地方也消失）
 const LOG = 'log'               // 诊断日志：每轮结束是否通知、播音结果
@@ -437,24 +438,30 @@ export const register: Register = (on, options) => {
     }
     // 等你决定 → 出错 / 中断 → 待你发出 → 完成，同类按跑完的先后
     notices.sort((a, b) => urgency(a) - urgency(b) || b.at - a.at)
+    // 横条够宽就排两列、多放一倍；名字太长截短，免得把一格撑破
+    const twoCol = Number(e.props.bodyColumns ?? 0) >= TWO_COL_MIN
+    const max = twoCol ? NOTICE_MAX * 2 : NOTICE_MAX
+    const short = (t: string) => (t.length > 16 ? `${t.slice(0, 15)}…` : t)
     return (
       <Box flexDirection="column">
-        {notices.slice(0, NOTICE_MAX).map(r => (
-          <Box key={`n-${r.id}`} flexDirection="row">
-            <Button key={`open-${r.id}`} onPress={async () => {
-              await $.store.set(seenKey(r.id), r.at)
-              void $.process.run(['open', `claude://code/continue?session=${r.localId}&source=desktop_action`])
-              $.ui.invalidate('ui.render')
-            }}>{[<Text key="dot" color="yellow">● </Text>, <Text key="lb">{`${iconOf(r)} ${nameOf(r)} · ${labelOf(r)} ↗`}</Text>].filter(Boolean)}</Button>
-            <Text dimColor wrap="truncate-end">  📁 {r.project} · {age(now - r.at)}</Text>
-            <Button key={`dismiss-${r.id}`} label="×" onPress={async () => {
-              await $.store.set(seenKey(r.id), r.at)
-              await $.store.set(hideKey(r.id), r.at)
-              $.ui.invalidate('ui.render')
-            }} />
-          </Box>
-        ))}
-        {notices.length > NOTICE_MAX && <Text key="more" dimColor>  还有 {notices.length - NOTICE_MAX} 个没看，在看板「待处理」里</Text>}
+        <Box key="notices" flexDirection="row" flexWrap="wrap">
+          {notices.slice(0, max).map(r => (
+            <Box key={`n-${r.id}`} flexDirection="row" width={twoCol ? '50%' : '100%'}>
+              <Button key={`open-${r.id}`} label={`${iconOf(r)} ${short(nameOf(r))} · ${labelOf(r)} ↗`} onPress={async () => {
+                await $.store.set(seenKey(r.id), r.at)
+                void $.process.run(['open', `claude://code/continue?session=${r.localId}&source=desktop_action`])
+                $.ui.invalidate('ui.render')
+              }} />
+              <Box key={`meta-${r.id}`} flexShrink={1}><Text dimColor wrap="truncate-end"> 📁 {r.project} · {age(now - r.at)}</Text></Box>
+              <Button key={`dismiss-${r.id}`} label="×" onPress={async () => {
+                await $.store.set(seenKey(r.id), r.at)
+                await $.store.set(hideKey(r.id), r.at)
+                $.ui.invalidate('ui.render')
+              }} />
+            </Box>
+          ))}
+        </Box>
+        {notices.length > max && <Text key="more" dimColor>  还有 {notices.length - max} 个没看，在看板「待处理」里</Text>}
         <Box flexDirection="row">
           <Button key="radar-toggle" label={isOpen ? '▾ 收起看板' : '▸ 最近 session'}
             onPress={() => setPane($, !isOpen)} />
