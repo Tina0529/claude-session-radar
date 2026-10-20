@@ -183,6 +183,33 @@ type St = {
   setupP: Promise<boolean> | null
 }
 
+// 同一个侧栏 session 续接 / 重开后，引擎的 session ID 会换，旧 ID 的记录会留下来（常常停在「运行中」）。
+// 读的时候按侧栏 ID（localId）去重，只留最新的一条（当前 session 优先）
+async function loadRecs($: any, me?: string): Promise<Rec[]> {
+  const best = new Map<string, Rec>()
+  for (const k of await $.store.keys()) {
+    if (!k.startsWith('s:')) continue
+    const r = (await $.store.get(k)) as Rec | undefined
+    if (!r || !(r.localId || r.id === me)) continue   // 只列有窗口的 session
+    const g = r.localId || r.id, cur = best.get(g)
+    if (!cur || (r.id === me) || (cur.id !== me && r.at > cur.at)) best.set(g, r)
+  }
+  return [...best.values()]
+}
+// 写的时候清掉：同一个侧栏 session 的旧 ID 记录删除，置顶转到新 ID 上
+async function dropStale($: any, keep: Rec) {
+  if (!keep.localId) return
+  let pins = ((await $.store.get(PINS)) as string[] | undefined) ?? []
+  for (const k of await $.store.keys()) {
+    if (!k.startsWith('s:') || k === key(keep.id)) continue
+    const r = (await $.store.get(k)) as Rec | undefined
+    if (!r || r.localId !== keep.localId) continue
+    if (pins.includes(r.id)) pins = [...pins.filter(x => x !== r.id && x !== keep.id), keep.id]
+    await $.store.delete(k); await $.store.delete(seenKey(r.id)); await $.store.delete(hideKey(r.id))
+  }
+  await $.store.set(PINS, pins)
+}
+
 // 认出「有窗口」的 session 并初始化。新建的 session 刚启动时，桌面 App 往往还没写好它的 local_*.json，
 // 一次查不到不能就此放弃（否则整个 session 都不显示、不记录）：之后发消息、回合开始 / 结束时再查，
 // 另外每 5 秒重试一次，最多 2 分钟
@@ -208,6 +235,7 @@ async function setupTracking($: any, st: St, cfg: Cfg): Promise<boolean> {
   if (found.localId) st.rec.localId = found.localId
   if (found.title) st.rec.title = found.title
   await $.store.set(key(st.rec.id), st.rec)
+  await dropStale($, st.rec)
 
   // 清理：过期记录 + 以前误记的无窗口记录（没有侧栏 ID 的）
   for (const k of await $.store.keys()) {
@@ -320,7 +348,7 @@ export const register: Register = (on, options) => {
     if (!st.rec) return out
     await loadTitles($)
     const found = await lookup($, st.rec.id)
-    if (found.localId) st.rec.localId = found.localId
+    if (found.localId && found.localId !== st.rec.localId) { st.rec.localId = found.localId; await dropStale($, st.rec) }
     if (found.title) st.rec.title = found.title
     st.tracked = st.interactive || !!st.rec.localId
     if (!st.tracked) return out
@@ -426,10 +454,8 @@ export const register: Register = (on, options) => {
     const me = st.rec?.id
     const n = { done: 0, error: 0, aborted: 0, running: 0, background: 0 }
     const notices: Rec[] = []
-    for (const k of await $.store.keys()) {
-      if (!k.startsWith('s:')) continue
-      const r = (await $.store.get(k)) as Rec | undefined
-      if (!r || !r.localId) continue
+    for (const r of await loadRecs($, me)) {
+      if (!r.localId) continue
       if (busy(r.state) || now - r.at < 3600_000) n[r.state] += 1
       // 快速切换栏：只列跑完以后你还没看过的；看过（切过去 / 点过 / 发过消息）就不再占位
       if (!(await isUnseen($, r, me, now))) continue
@@ -580,12 +606,7 @@ export const register: Register = (on, options) => {
     }
 
     // ── 会话页 ──────────────────────────────────────────
-    const all: Rec[] = []
-    for (const k of await $.store.keys()) {
-      if (!k.startsWith('s:')) continue
-      const r = (await $.store.get(k)) as Rec | undefined
-      if (r && (r.localId || r.id === me)) all.push(r)   // 只列有窗口的 session
-    }
+    const all: Rec[] = await loadRecs($, me)   // 只列有窗口的 session，同一个侧栏 session 只留一条
     const pins = ((await $.store.get(PINS)) as string[] | undefined) ?? []
     const pinned = (r: Rec) => pins.includes(r.id)
     all.sort((a, b) => b.at - a.at)
