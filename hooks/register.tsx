@@ -36,10 +36,12 @@ type Rec = {
 const ICON: Record<Rec['state'], string> = { running: '⏳', background: '🔄', done: '✅', aborted: '⏹', error: '❌' }
 const LABEL: Record<Rec['state'], string> = { running: '运行中', background: '后台运行中', done: '完成', aborted: '已中断', error: '出错' }
 // 「完成」再细分：等你决定 / 待你发出（每轮答完时由小模型读回答判断）
-const iconOf = (r: Rec) => (r.state === 'done' && r.need === 'decide' ? '🔴' : r.state === 'done' && r.need === 'send' ? '📤' : ICON[r.state])
-const labelOf = (r: Rec) => (r.state === 'done' && r.need === 'decide' ? '等你决定' : r.state === 'done' && r.need === 'send' ? '待你发出' : LABEL[r.state])
-// 越靠前越该先处理：等你决定 → 出错 / 中断 → 待你发出 → 完成
-const urgency = (r: Rec) => (r.state === 'done' && r.need === 'decide' ? 0 : r.state === 'error' || r.state === 'aborted' ? 1 : r.state === 'done' && r.need === 'send' ? 2 : 3)
+const iconOf = (r: Rec, stale = false) => (stale ? '⏸' : r.state === 'done' && r.need === 'decide' ? '🔴' : r.state === 'done' && r.need === 'send' ? '📤' : ICON[r.state])
+const labelOf = (r: Rec, stale = false) => (stale ? '可能已停止' : r.state === 'done' && r.need === 'decide' ? '等你决定' : r.state === 'done' && r.need === 'send' ? '待你发出' : LABEL[r.state])
+// 列表里要不要写状态文字：🔴（就是等你决定）和 ✅ 只看图标就懂，不写
+const showLabel = (r: Rec, stale = false) => stale || r.state !== 'done' || r.need === 'send'
+// 越靠前越该先处理：等你决定 → 出错 / 中断 → 待你发出 → 完成 → 搁置（超过一天没回的 🔴）
+const urgency = (r: Rec, now = 0) => (r.state === 'done' && r.need === 'decide' ? (now && now - r.at > DECIDE_FRESH_MS ? 4 : 0) : r.state === 'error' || r.state === 'aborted' ? 1 : r.state === 'done' && r.need === 'send' ? 2 : 3)
 
 const TRIAGE_SYSTEM = [
   '你判断 AI 编程助手刚答完的一轮回答，用户接下来要做什么。只输出一个词：DECIDE、SEND 或 DONE。',
@@ -86,19 +88,26 @@ let TITLES: Record<string, string> = {}
 // 桌面 App 记录的「最后切到这个 session 的时刻」：切过去看过就算已读（和名字一起读，不单独轮询）
 const FOCUS_KEY = 'focus'
 let FOCUS: Record<string, number> = {}
+// 同时读：最后活动时刻（判断「运行中」是不是早停了）、是否已归档（归档的不列），以及读的时刻
+const ACT_KEY = 'act', ARCH_KEY = 'arch', SNAP_KEY = 'snapAt'
+let ACT: Record<string, number> = {}
+let ARCH: Record<string, boolean> = {}
+let SNAP_AT = 0
+const STALE_MS = 30 * 60_000          // 「运行中」超过这么久没有任何活动 → 可能已停止（App 退出时没跑完）
+const DECIDE_FRESH_MS = 86400_000     // 🔴 超过一天还没回 → 搁置（变暗、沉底、不计数）
 const titleOf = (r: Rec) => TITLES[r.id] || r.title
 const nameOf = (r: Rec) => { const t = titleOf(r); return t && !GENERIC_TITLE.test(t) ? t : r.project }
 const READ_TITLES = [
   'import glob, json, os',
-  'd, fo = {}, {}',
+  'd, fo, act, ar = {}, {}, {}, {}',
   'for f in glob.glob(os.path.expanduser("~/Library/Application Support/Claude/claude-code-sessions/*/*/local_*.json")):',
   '    try:',
   '        j = json.load(open(f)); c = j.get("cliSessionId")',
-  '        if c: d[c] = j.get("title") or ""; fo[c] = j.get("lastFocusedAt") or 0',
+  '        if c: d[c] = j.get("title") or ""; fo[c] = j.get("lastFocusedAt") or 0; act[c] = j.get("lastActivityAt") or 0; ar[c] = bool(j.get("isArchived"))',
   '    except Exception: pass',
-  'print(json.dumps({"titles": d, "focus": fo}, ensure_ascii=False))',
+  'print(json.dumps({"titles": d, "focus": fo, "act": act, "arch": ar}, ensure_ascii=False))',
 ].join('\n')
-async function readTitles($: any): Promise<{ titles: Record<string, string>; focus: Record<string, number> } | null> {
+async function readTitles($: any): Promise<{ titles: Record<string, string>; focus: Record<string, number>; act: Record<string, number>; arch: Record<string, boolean> } | null> {
   try {
     const { exitCode, stdout } = await $.process.run(['/usr/bin/python3', '-c', READ_TITLES], { timeoutMs: 10000 })
     return exitCode === 0 ? JSON.parse(stdout) : null
@@ -106,13 +115,25 @@ async function readTitles($: any): Promise<{ titles: Record<string, string>; foc
 }
 async function refreshTitles($: any) {
   const r = await readTitles($)
-  if (r) { TITLES = r.titles; FOCUS = r.focus; await $.store.set(TITLES_KEY, r.titles); await $.store.set(FOCUS_KEY, r.focus) }
+  if (r) {
+    TITLES = r.titles; FOCUS = r.focus; ACT = r.act || {}; ARCH = r.arch || {}; SNAP_AT = await $.clock.now()
+    await $.store.set(TITLES_KEY, r.titles); await $.store.set(FOCUS_KEY, r.focus)
+    await $.store.set(ACT_KEY, ACT); await $.store.set(ARCH_KEY, ARCH); await $.store.set(SNAP_KEY, SNAP_AT)
+  }
   return r?.titles ?? null
 }
 async function loadTitles($: any) {
   TITLES = ((await $.store.get(TITLES_KEY)) as Record<string, string> | undefined) ?? TITLES
   FOCUS = ((await $.store.get(FOCUS_KEY)) as Record<string, number> | undefined) ?? FOCUS
+  ACT = ((await $.store.get(ACT_KEY)) as Record<string, number> | undefined) ?? ACT
+  ARCH = ((await $.store.get(ARCH_KEY)) as Record<string, boolean> | undefined) ?? ARCH
+  SNAP_AT = Number((await $.store.get(SNAP_KEY)) ?? SNAP_AT)
 }
+// 「运行中」其实早停了：别的 session、开始超过 30 分钟，且上次读 App 记录时它已经 30 分钟没活动
+// （记录里已经不是这个引擎 ID = 被续接取代了，也算）
+const isStale = (r: Rec, me: string | undefined, now: number) =>
+  busy(r.state) && r.id !== me && SNAP_AT > 0 && now - r.at > STALE_MS && (ACT[r.id] === undefined || SNAP_AT - ACT[r.id] > STALE_MS)
+const isShelved = (r: Rec, now: number) => r.state === 'done' && r.need === 'decide' && now - r.at > DECIDE_FRESH_MS
 // 跑完以后还没看过（一天内）= 待处理：点过横条 / 看板、在里面发过消息、或在 App 里切过去看过，都算看过
 async function isUnseen($: any, r: Rec, me: string | undefined, now: number) {
   if (r.id === me || busy(r.state) || r.turns === 0 || now - r.at >= UNSEEN_MS) return false
@@ -455,7 +476,8 @@ export const register: Register = (on, options) => {
     const n = { done: 0, error: 0, aborted: 0, running: 0, background: 0 }
     const notices: Rec[] = []
     for (const r of await loadRecs($, me)) {
-      if (!r.localId) continue
+      if (!r.localId || ARCH[r.id]) continue
+      if (isStale(r, me, now)) continue          // 早停的「运行中」不算
       if (busy(r.state) || now - r.at < 3600_000) n[r.state] += 1
       // 快速切换栏：只列跑完以后你还没看过的；看过（切过去 / 点过 / 发过消息）就不再占位
       if (!(await isUnseen($, r, me, now))) continue
@@ -473,7 +495,7 @@ export const register: Register = (on, options) => {
         <Box key="notices" flexDirection="row" flexWrap="wrap">
           {notices.slice(0, max).map(r => (
             <Box key={`n-${r.id}`} flexDirection="row" width={twoCol ? '50%' : '100%'}>
-              <Button key={`open-${r.id}`} label={`${iconOf(r)} ${short(nameOf(r))} · ${labelOf(r)} ↗`} onPress={async () => {
+              <Button key={`open-${r.id}`} label={`${iconOf(r)} ${short(nameOf(r))}${showLabel(r) ? ` · ${labelOf(r)}` : ''} ↗`} onPress={async () => {
                 await $.store.set(seenKey(r.id), r.at)
                 void $.process.run(['open', `claude://code/continue?session=${r.localId}&source=desktop_action`])
                 $.ui.invalidate('ui.render')
@@ -606,11 +628,13 @@ export const register: Register = (on, options) => {
     }
 
     // ── 会话页 ──────────────────────────────────────────
-    const all: Rec[] = await loadRecs($, me)   // 只列有窗口的 session，同一个侧栏 session 只留一条
+    // 只列有窗口、没归档的 session，同一个侧栏 session 只留一条；当前 session 放最上面
+    const all: Rec[] = (await loadRecs($, me)).filter(r => !ARCH[r.id])
     const pins = ((await $.store.get(PINS)) as string[] | undefined) ?? []
     const pinned = (r: Rec) => pins.includes(r.id)
-    all.sort((a, b) => b.at - a.at)
-    const color = (r: Rec) => (r.state === 'done' ? (r.need === 'decide' ? 'red' : r.need === 'send' ? 'magenta' : 'green') : r.state === 'running' ? 'yellow' : r.state === 'background' ? 'cyan' : r.state === 'error' ? 'red' : 'gray')
+    all.sort((a, b) => Number(b.id === me) - Number(a.id === me) || b.at - a.at)
+    const stale = new Set(all.filter(r => isStale(r, me, now)).map(r => r.id))
+    const color = (r: Rec) => (stale.has(r.id) || isShelved(r, now) ? 'gray' : r.state === 'done' ? (r.need === 'decide' ? 'red' : r.need === 'send' ? 'magenta' : 'green') : r.state === 'running' ? 'yellow' : r.state === 'background' ? 'cyan' : r.state === 'error' ? 'red' : 'gray')
 
     // 跑完后还没回去看过（一天内）的 session 标黄点 = 待处理（和横条的完成提示共用「已看过」标记）
     const unseen = new Set<string>()
@@ -619,18 +643,20 @@ export const register: Register = (on, options) => {
     }
     const groups: Record<string, Rec[]> = {
       // 待处理 = 跑完没看过的 + 还在等你决定的（看过但还没回它），等你决定的排前面
-      todo: all.filter(r => unseen.has(r.id) || (r.id !== me && r.state === 'done' && r.need === 'decide')).sort((a, b) => urgency(a) - urgency(b) || b.at - a.at),
-      run: all.filter(r => busy(r.state)),
+      // 超过一天没回的 🔴 = 搁置：变暗沉底，不计入待处理的数字
+      todo: all.filter(r => unseen.has(r.id) || (r.id !== me && r.state === 'done' && r.need === 'decide')).sort((a, b) => urgency(a, now) - urgency(b, now) || b.at - a.at),
+      run: all.filter(r => busy(r.state) && !stale.has(r.id)),
       pin: all.filter(pinned),
-      all: [...all.filter(pinned), ...all.filter(r => !pinned(r))],
+      all: [...all.filter(r => r.id === me), ...all.filter(r => pinned(r) && r.id !== me), ...all.filter(r => !pinned(r) && r.id !== me)],
     }
+    const countOf = (k: string) => (k === 'todo' ? groups.todo.filter(r => !isShelved(r, now)).length : groups[k].length)
     const stored = (await $.store.get(SUB)) as string | undefined
     const sub = stored && groups[stored] ? stored : (groups.todo.length ? 'todo' : 'all')
     const SUBS: [string, string][] = [['todo', '待处理'], ['run', '运行中'], ['pin', '★ 置顶'], ['all', '全部']]
     const subTabs = (
       <Box key="subtabs" flexDirection="row" flexWrap="wrap" marginBottom={1}>
         {SUBS.map(([k, label]) => (
-          <Button key={`sub-${k}`} label={`${sub === k ? '● ' : ''}${label} ${groups[k].length}`} dimColor={sub !== k} onPress={async () => {
+          <Button key={`sub-${k}`} label={`${sub === k ? '● ' : ''}${label} ${countOf(k)}`} dimColor={sub !== k} onPress={async () => {
             await $.store.set(SUB, k); $.ui.invalidate('ui.render')
           }} />
         ))}
@@ -643,6 +669,12 @@ export const register: Register = (on, options) => {
     const list = q ? groups.all.filter(hit) : groups[sub]
     const rows = list.slice(0, Math.max(3, (e.viewport?.rows ?? 30) - 6))
     let hot = 0                       // 可跳转的前 9 行配数字快捷键（看板有焦点时按 1-9）
+    // 「全部」和搜索结果按 当前 / 置顶 / 今天 / 昨天 / 更早 分段
+    const dayKey = (ms: number) => new Date(ms).toDateString()
+    const today = dayKey(now), yesterday = dayKey(now - 86400_000)
+    const bucket = (r: Rec) => (r.id === me ? '当前' : pinned(r) ? '★ 置顶' : dayKey(r.at) === today ? '今天' : dayKey(r.at) === yesterday ? '昨天' : '更早')
+    const sectioned = !!q || sub === 'all'
+    let lastBucket = ''
 
     return (
       <Box flexDirection="column">
@@ -657,20 +689,29 @@ export const register: Register = (on, options) => {
         {rows.map(r => {
           const canOpen = r.id !== me && !!r.localId
           const key = canOpen && hot < 9 ? String(++hot) : undefined
+          const sl = stale.has(r.id), shelved = isShelved(r, now)
+          const b = sectioned ? bucket(r) : ''
+          const header = b && b !== lastBucket ? b : ''
+          lastBucket = b || lastBucket
           // 标题行：整行就是按钮，点名字直接切过去；年龄放在按钮里，所以必须给固定 key
           const title = [
             unseen.has(r.id) && <Text key="dot" color="yellow">● </Text>,
-            <Text key="st" color={color(r)} bold>{iconOf(r)} {r.state === 'done' && !r.need ? '' : `${labelOf(r)}${r.state === 'background' && r.bg ? ` ${r.bg}` : ''} `}</Text>,
-            <Text key="nm" bold>{nameOf(r)}</Text>,
+            <Text key="st" color={color(r)} bold>{iconOf(r, sl)} {showLabel(r, sl) ? `${labelOf(r, sl)}${r.state === 'background' && r.bg && !sl ? ` ${r.bg}` : ''} ` : ''}</Text>,
+            <Text key="nm" bold={!shelved && !sl} dimColor={shelved || sl}>{nameOf(r)}</Text>,
             r.id === me && <Text key="me" color="cyan"> (当前)</Text>,
             <Text key="age" dimColor>  {age(now - r.at)}{canOpen ? '  ↗' : ''}</Text>,
           ].filter(Boolean)            // 按钮里只能放 Text，false 要先去掉
+          const said = r.ask && !isNoise(r.ask) ? ` · 你说「${r.ask}」` : ''
           const meta = r.turns === 0 && !busy(r.state)
             ? '还没跑过'
-            : `${r.state === 'running' ? '进行中' : r.state === 'background' ? `主回合 ${dur(r.seconds)}，后台 ${r.bg ?? '?'} 个任务在跑` : `用时 ${dur(r.seconds)}`} · 工具 ${r.tools} 次${r.ask && !isNoise(r.ask) ? ` · 你说「${r.ask}」` : ''}`
+            : sl ? `App 退出时没跑完，最后活动 ${age(now - (ACT[r.id] || r.at))}${said}`
+            : r.state === 'running' ? `已跑 ${dur(Math.round((now - r.startedAt) / 1000))}${said}`
+            : r.state === 'background' ? `主回合 ${dur(r.seconds)}，后台 ${r.bg ?? '?'} 个任务在跑${said}`
+            : `${shelved ? '超过一天没回 · ' : ''}用时 ${dur(r.seconds)} · 工具 ${r.tools} 次${said}`
           return (
             <Box key={r.id} flexDirection="column" marginBottom={1}>
-              <Box flexDirection="row">
+              {header && <Text key={`h-${r.id}`} bold dimColor>— {header} —</Text>}
+              <Box flexDirection="row" marginLeft={key ? 0 : 3}>
                 {canOpen
                   ? <Button key={`go-${r.id}`} plain hotkey={key} onPress={async () => {
                       await $.store.set(seenKey(r.id), r.at)
@@ -688,7 +729,7 @@ export const register: Register = (on, options) => {
             </Box>
           )
         })}
-        <Text key="hint" dimColor>点名字直接切过去 · ☆ 置顶 · 黄点 = 一天内跑完还没看 · 🔄 = 后台 subagent 还在跑</Text>
+        <Text key="hint" dimColor>点名字直接切过去 · ☆ 置顶 · 🔴 等你决定 · 📤 待你发出 · 黄点 = 跑完还没看 · ⏸ = App 退出时没跑完</Text>
       </Box>
     )
   })
