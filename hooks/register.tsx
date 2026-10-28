@@ -474,18 +474,26 @@ export const register: Register = (on, options) => {
     const isOpen = (await $.store.get(PREF)) === true
     const me = st.rec?.id
     const n = { done: 0, error: 0, aborted: 0, running: 0, background: 0 }
-    const notices: Rec[] = []
+    // 快速切换栏按这个顺序补满：① 跑完还没看过的 ② 看过但还没回的 🔴（一天内）③ 正在跑的 ④ 置顶的
+    // 看过、回过的普通「完成」不放（免得最近几个来回轮换）
+    const pins = ((await $.store.get(PINS)) as string[] | undefined) ?? []
+    const unseenL: Rec[] = [], decideL: Rec[] = [], runL: Rec[] = [], pinL: Rec[] = []
     for (const r of await loadRecs($, me)) {
       if (!r.localId || ARCH[r.id]) continue
       if (isStale(r, me, now)) continue          // 早停的「运行中」不算
       if (busy(r.state) || now - r.at < 3600_000) n[r.state] += 1
-      // 快速切换栏：只列跑完以后你还没看过的；看过（切过去 / 点过 / 发过消息）就不再占位
-      if (!(await isUnseen($, r, me, now))) continue
-      if (r.at <= Number((await $.store.get(hideKey(r.id))) ?? 0)) continue
-      notices.push(r)
+      if (r.id === me) continue
+      if (r.at <= Number((await $.store.get(hideKey(r.id))) ?? 0)) continue   // 点过 × 的，下次跑完前不再出现
+      if (await isUnseen($, r, me, now)) unseenL.push(r)
+      else if (r.state === 'done' && r.need === 'decide' && !isShelved(r, now)) decideL.push(r)
+      else if (busy(r.state)) runL.push(r)
+      else if (pins.includes(r.id)) pinL.push(r)
     }
-    // 等你决定 → 出错 / 中断 → 待你发出 → 完成，同类按跑完的先后
-    notices.sort((a, b) => urgency(a) - urgency(b) || b.at - a.at)
+    // 没看过的：等你决定 → 出错 / 中断 → 待你发出 → 完成，同类按跑完的先后
+    unseenL.sort((a, b) => urgency(a) - urgency(b) || b.at - a.at)
+    for (const L of [decideL, runL, pinL]) L.sort((a, b) => b.at - a.at)
+    const notices = [...unseenL, ...decideL, ...runL, ...pinL]
+    const isNew = new Set(unseenL.map(r => r.id))
     // 横条够宽就排两列、多放一倍；名字太长截短，免得把一格撑破
     const twoCol = Number(e.props.bodyColumns ?? 0) >= TWO_COL_MIN
     const max = twoCol ? NOTICE_MAX * 2 : NOTICE_MAX
@@ -499,13 +507,13 @@ export const register: Register = (on, options) => {
             <Box key={`nrow-${i}`} flexDirection="row">
               {pair.flatMap((r, j) => [
                 j > 0 && <Text key={`sep-${r.id}`} dimColor>   │   </Text>,
-                <Button key={`open-${r.id}`} label={`${iconOf(r)} ${short(nameOf(r))}${showLabel(r) ? ` · ${labelOf(r)}` : ''} ↗`} onPress={async () => {
+                <Button key={`open-${r.id}`} plain label={`${iconOf(r)} ${short(nameOf(r))}${showLabel(r) && !busy(r.state) ? ` · ${labelOf(r)}` : ''} ↗`} onPress={async () => {
                   await $.store.set(seenKey(r.id), r.at)
                   void $.process.run(['open', `claude://code/continue?session=${r.localId}&source=desktop_action`])
                   $.ui.invalidate('ui.render')
                 }} />,
-                <Text key={`meta-${r.id}`} dimColor> {twoCol ? age(now - r.at) : `📁 ${r.project} · ${age(now - r.at)}`} </Text>,
-                <Button key={`dismiss-${r.id}`} label="×" onPress={async () => {
+                <Text key={`meta-${r.id}`} dimColor> {(() => { const t = busy(r.state) ? `已跑 ${dur(Math.round((now - r.startedAt) / 1000))}` : !isNew.has(r.id) && pins.includes(r.id) && r.need !== 'decide' ? `★ ${age(now - r.at)}` : age(now - r.at); return twoCol ? t : `📁 ${r.project} · ${t}` })()} </Text>,
+                <Button key={`dismiss-${r.id}`} plain dimColor label="×" onPress={async () => {
                   await $.store.set(seenKey(r.id), r.at)
                   await $.store.set(hideKey(r.id), r.at)
                   $.ui.invalidate('ui.render')
@@ -514,11 +522,11 @@ export const register: Register = (on, options) => {
             </Box>
           )
         })}
-        {notices.length > max && <Text key="more" dimColor>  还有 {notices.length - max} 个没看，在看板「待处理」里</Text>}
+        {unseenL.length > max && <Text key="more" dimColor>  还有 {unseenL.length - max} 个没看，在看板「待处理」里</Text>}
         {/* 统计行：左边是自己的统计，右边接下层插件（比如 voice-reply 的「🔊 朗读 · 声音」），中间用伸缩空白撑开 */}
         <Box key="stats-row" flexDirection="row">
         <Box key="stats" flexDirection="row">
-          <Button key="radar-toggle" label={isOpen ? '▾ 看板' : '▸ 看板'}
+          <Button key="radar-toggle" plain label={isOpen ? '▾ 看板' : '▸ 看板'}
             onPress={() => setPane($, !isOpen)} />
           <Text dimColor> 近1小时 </Text>
           <Text color="green">✅{n.done} </Text>
