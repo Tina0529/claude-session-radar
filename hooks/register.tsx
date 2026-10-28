@@ -489,29 +489,34 @@ export const register: Register = (on, options) => {
     // 横条够宽就排两列、多放一倍；名字太长截短，免得把一格撑破
     const twoCol = Number(e.props.bodyColumns ?? 0) >= TWO_COL_MIN
     const max = twoCol ? NOTICE_MAX * 2 : NOTICE_MAX
-    const short = (t: string) => (t.length > 16 ? `${t.slice(0, 15)}…` : t)
+    const short = (t: string) => (t.length > 14 ? `${t.slice(0, 13)}…` : t)
     return (
       <Box flexDirection="column">
-        <Box key="notices" flexDirection="row" flexWrap="wrap">
-          {notices.slice(0, max).map(r => (
-            <Box key={`n-${r.id}`} flexDirection="row" width={twoCol ? '50%' : '100%'}>
-              <Button key={`open-${r.id}`} label={`${iconOf(r)} ${short(nameOf(r))}${showLabel(r) ? ` · ${labelOf(r)}` : ''} ↗`} onPress={async () => {
-                await $.store.set(seenKey(r.id), r.at)
-                void $.process.run(['open', `claude://code/continue?session=${r.localId}&source=desktop_action`])
-                $.ui.invalidate('ui.render')
-              }} />
-              <Box key={`meta-${r.id}`} flexShrink={1}><Text dimColor wrap="truncate-end"> 📁 {r.project} · {age(now - r.at)}</Text></Box>
-              <Button key={`dismiss-${r.id}`} label="×" onPress={async () => {
-                await $.store.set(seenKey(r.id), r.at)
-                await $.store.set(hideKey(r.id), r.at)
-                $.ui.invalidate('ui.render')
-              }} />
+        {/* 两列 = 每两个手动拼成一行（不用百分比宽度和自动换行：桌面版算不准，会互相压住） */}
+        {Array.from({ length: Math.ceil(Math.min(notices.length, max) / (twoCol ? 2 : 1)) }, (_, i) => {
+          const pair = notices.slice(0, max).slice(i * (twoCol ? 2 : 1), (i + 1) * (twoCol ? 2 : 1))
+          return (
+            <Box key={`nrow-${i}`} flexDirection="row">
+              {pair.flatMap((r, j) => [
+                j > 0 && <Text key={`sep-${r.id}`} dimColor>   │   </Text>,
+                <Button key={`open-${r.id}`} label={`${iconOf(r)} ${short(nameOf(r))}${showLabel(r) ? ` · ${labelOf(r)}` : ''} ↗`} onPress={async () => {
+                  await $.store.set(seenKey(r.id), r.at)
+                  void $.process.run(['open', `claude://code/continue?session=${r.localId}&source=desktop_action`])
+                  $.ui.invalidate('ui.render')
+                }} />,
+                <Text key={`meta-${r.id}`} dimColor> {twoCol ? age(now - r.at) : `📁 ${r.project} · ${age(now - r.at)}`} </Text>,
+                <Button key={`dismiss-${r.id}`} label="×" onPress={async () => {
+                  await $.store.set(seenKey(r.id), r.at)
+                  await $.store.set(hideKey(r.id), r.at)
+                  $.ui.invalidate('ui.render')
+                }} />,
+              ].filter(Boolean))}
             </Box>
-          ))}
-        </Box>
+          )
+        })}
         {notices.length > max && <Text key="more" dimColor>  还有 {notices.length - max} 个没看，在看板「待处理」里</Text>}
-        {/* 统计行：左边是自己的统计，右边接下层插件（比如 voice-reply 的「🔊 朗读 · 声音」），窄时自动换行 */}
-        <Box key="stats-row" flexDirection="row" flexWrap="wrap" justifyContent="space-between">
+        {/* 统计行：左边是自己的统计，右边接下层插件（比如 voice-reply 的「🔊 朗读 · 声音」），中间用伸缩空白撑开 */}
+        <Box key="stats-row" flexDirection="row">
         <Box key="stats" flexDirection="row">
           <Button key="radar-toggle" label={isOpen ? '▾ 看板' : '▸ 看板'}
             onPress={() => setPane($, !isOpen)} />
@@ -524,6 +529,7 @@ export const register: Register = (on, options) => {
             <Text dimColor> · 今天 {fmtTok(st.usage.ranges.today.totals.total)} token ≈ {fmtUsd(st.usage.ranges.today.totals.cost)}</Text>
           )}
         </Box>
+        {below ? <Box key="gap" flexGrow={1} /> : null}
         {below ? <Box key="below">{below}</Box> : null}
         </Box>
       </Box>
